@@ -2,8 +2,11 @@
 """
 NSE F&O Intraday Scanner - SOP Volume IV (strict 1:5 reward:risk)
 =================================================================
-Scans the NSE F&O cash universe for four intraday setups and writes a
-Markdown report plus a CSV log. Optional Telegram alerts.
+Scans the NSE F&O cash universe for four intraday setups. Writes a
+Markdown report, sends Telegram alerts, and maintains a self-updating
+trade journal (journal/trade_journal.csv + journal/daily_summary.csv)
+with automatic exit grading, EOD square-off rows and a -2R circuit
+breaker that stops new signal journaling for the rest of the day.
 
 Strategies
   S1  Opening Range Breakout (09:15-09:30 range) to a strict 5R target
@@ -22,11 +25,13 @@ and 15:20 IST, Monday-Friday. It reads the IST clock itself:
 
 Data source: Yahoo Finance via the free `yfinance` library (no API key).
 Optional test hooks (environment variables):
-  SCANNER_FORCE_DATE=YYYY-MM-DD   dry-run a past session (evaluated 12:30 IST)
+  SCANNER_FORCE_DATE=YYYY-MM-DD   dry-run a past session
+  SCANNER_FORCE_TIME=HH:MM        IST clock override for dry-runs (default 12:30)
   SCANNER_TEST_LIMIT=N            scan only the first N symbols (debug)
 """
 
 import os
+import csv
 import json
 import math
 import time
@@ -64,11 +69,12 @@ REPORTS_DIR  = "reports"
 # ------------------------------------------------------------------
 
 def now_ist():
-    """Current time in IST (or a forced past time for dry-runs)."""
+    """Current time in IST (or a forced past session for dry-runs)."""
     force = os.environ.get("SCANNER_FORCE_DATE", "")
     if force:
         d = dt.datetime.strptime(force, "%Y-%m-%d").date()
-        return dt.datetime(d.year, d.month, d.day, 12, 30, tzinfo=IST)
+        hh, mm = map(int, os.environ.get("SCANNER_FORCE_TIME", "12:30").split(":"))
+        return dt.datetime(d.year, d.month, d.day, hh, mm, tzinfo=IST)
     return dt.datetime.now(IST)
 
 
@@ -427,6 +433,308 @@ def card(s, new):
 
 
 # ------------------------------------------------------------------
+# Trade journal - journal/trade_journal.csv + journal/daily_summary.csv
+# Mirrors the manual journal from the SOP, maintained automatically:
+#   * a fired signal appends an OPEN row to trade_journal.csv
+#   * every later run grades open rows against completed 5-minute bars
+#     (STOP_HIT / TARGET_HIT; stop checked first inside one bar, because
+#     a single bar cannot reveal which level was touched first - the
+#     scanner always grades conservatively)
+#   * the WRAP sweep force-closes leftovers as EOD_SQUAREOFF at the
+#     last traded price; rows stranded from earlier sessions are closed
+#     against that date's daily candle
+#   * daily_summary.csv keeps one evolving row per trading day
+#   * circuit breaker (SOP money rule): day P/L <= -2R or 2 consecutive
+#     losses stop NEW signal journaling until the next session
+# The journal grades the SIGNAL (entry at signal price, no slippage),
+# not your broker fill - your execution ledger stays with your broker.
+# ------------------------------------------------------------------
+
+JOURNAL_DIR = "journal"
+TJ_FILE = os.path.join(JOURNAL_DIR, "trade_journal.csv")
+DS_FILE = os.path.join(JOURNAL_DIR, "daily_summary.csv")
+DAILY_LOSS_R = 2.0        # circuit breaker: day P/L that trips the breaker
+LOSS_STREAK_TRIP = 2      # circuit breaker: consecutive losses that trip it
+RR_LABEL = "1:5"
+
+TJ_COLS = ("TradeID", "Date", "SignalTime", "Symbol", "Direction", "Setup",
+           "Entry", "StopLoss", "Target", "Qty", "RiskPerShare", "RiskAmt",
+           "RewardAmt", "RR", "Status", "ExitPrice", "ExitTime", "ExitReason",
+           "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Notes")
+DS_COLS = ("Date", "Trades", "Wins", "Losses", "Flats", "Open", "WinRatePct",
+           "NetR", "NetPnlAmt", "BreakerTripped", "DayVerdict", "Notes")
+SETUP_NAMES = {"S1": "S1_ORB_BREAKOUT", "S2": "S2_VWAP_PULLBACK",
+               "S3": "S3_SUPERTREND_FLIP", "S4": "S4_NR7_EXPANSION"}
+
+
+def read_csv_rows(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return [dict(r) for r in csv.DictReader(f)]
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def write_csv_rows(path, cols, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(cols), extrasaction="ignore",
+                           restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r.get(c, "") for c in cols})
+    os.replace(tmp, path)
+
+
+def _fmt_signed(v, dp):
+    if abs(v) < 0.5 * 10 ** (-dp):
+        return f"{0:.{dp}f}"
+    return f"{v:+.{dp}f}" if v > 0 else f"{v:.{dp}f}"
+
+
+def unique_trade_id(rows, day, sym, side):
+    base = f"{day:%Y%m%d}-{sym}-{side}"
+    existing = {r.get("TradeID", "") for r in rows}
+    tid, n = base, 2
+    while tid in existing:
+        tid = f"{base}-{n}"
+        n += 1
+    return tid
+
+
+def signal_to_row(sig, day, now, trade_id):
+    """Turn a fired signal into an OPEN journal row."""
+    side = "LONG" if sig["target"] > sig["entry"] else "SHORT"
+    rps = round(abs(sig["entry"] - sig["stop"]), 2)
+    qty = int(sig["qty"])
+    return {
+        "TradeID": trade_id,
+        "Date": str(day),
+        "SignalTime": f"{now:%H:%M}",
+        "Symbol": sig["symbol"],
+        "Direction": side,
+        "Setup": SETUP_NAMES.get(sig["strategy"], sig["strategy"]),
+        "Entry": f"{sig['entry']:.2f}",
+        "StopLoss": f"{sig['stop']:.2f}",
+        "Target": f"{sig['target']:.2f}",
+        "Qty": qty,
+        "RiskPerShare": f"{rps:.2f}",
+        "RiskAmt": f"{qty * rps:.2f}",
+        "RewardAmt": f"{qty * abs(sig['target'] - sig['entry']):.2f}",
+        "RR": RR_LABEL,
+        "Status": "OPEN",
+        "ExitPrice": "", "ExitTime": "", "ExitReason": "",
+        "Result": "", "PnL_R": "", "PnL_Amt": "",
+        "UpdatedAt": f"{now:%Y-%m-%d %H:%M:%S}",
+        "Notes": sig.get("why", ""),
+    }
+
+
+def close_row(row, px, exit_time, reason, now):
+    """Grade one row at an exit price and stamp the audit columns."""
+    sign = 1.0 if row["Direction"] == "LONG" else -1.0
+    entry = float(row["Entry"])
+    rps = float(row["RiskPerShare"]) or 1e-9
+    qty = int(float(row["Qty"]))
+    pnl_r = round(sign * (px - entry) / rps, 3)
+    row["Status"] = "CLOSED"
+    row["ExitPrice"] = f"{px:.2f}"
+    row["ExitTime"] = exit_time
+    row["ExitReason"] = reason
+    row["PnL_R"] = f"{pnl_r:.3f}"
+    row["PnL_Amt"] = f"{round(sign * (px - entry) * qty, 2):.2f}"
+    row["Result"] = ("WIN" if pnl_r > 0.0005
+                     else ("LOSS" if pnl_r < -0.0005 else "FLAT"))
+    row["UpdatedAt"] = f"{now:%Y-%m-%d %H:%M:%S}"
+
+
+def _bar_hit(row, hi, lo):
+    """(stop_touched, target_touched) for one bar; stop checked first."""
+    sl, tg = float(row["StopLoss"]), float(row["Target"])
+    if row["Direction"] == "LONG":
+        return lo <= sl + 1e-9, hi >= tg - 1e-9
+    return hi >= sl - 1e-9, lo <= tg + 1e-9
+
+
+def monitor_journal(rows, bars, daily, day, now):
+    """Grade OPEN rows: today's rows against completed 5-min bars, rows
+    stranded from earlier sessions against that date's daily candle.
+    Returns (graded_today, stale_closed)."""
+    graded = stale = 0
+    for row in rows:
+        if row.get("Status") != "OPEN":
+            continue
+        rdate = row.get("Date", "")
+        sym = row.get("Symbol", "") + ".NS"
+        if rdate == str(day):
+            b = bars.get(sym)
+            if b is None or not len(b):
+                continue
+            try:
+                hh, mm = map(int, str(row.get("SignalTime", "9:15")).split(":"))
+            except ValueError:
+                hh, mm = 9, 15
+            bb = b[[t.time() >= dt.time(hh, mm) for t in b.index]]
+            hit = None
+            for ts, br in bb.iterrows():
+                hit_stop, hit_tgt = _bar_hit(row, float(br["High"]),
+                                             float(br["Low"]))
+                if hit_stop:
+                    hit = (float(row["StopLoss"]), ts, "STOP_HIT")
+                    break
+                if hit_tgt:
+                    hit = (float(row["Target"]), ts, "TARGET_HIT")
+                    break
+            if hit:
+                close_row(row, hit[0], f"{hit[1]:%H:%M}", hit[2], now)
+                graded += 1
+        else:
+            px, reason = None, None
+            d = daily.get(sym)
+            if d is not None and len(d):
+                idx = pd.to_datetime(d.index)
+                try:
+                    idx = idx.tz_localize(None)
+                except (TypeError, AttributeError):
+                    pass
+                d2 = d[[str(t.date()) == rdate for t in idx]]
+                if len(d2):
+                    r = d2.iloc[-1]
+                    hit_stop, hit_tgt = _bar_hit(row, float(r["High"]),
+                                                 float(r["Low"]))
+                    if hit_stop:
+                        px, reason = float(row["StopLoss"]), "STOP_HIT"
+                    elif hit_tgt:
+                        px, reason = float(row["Target"]), "TARGET_HIT"
+                    else:
+                        px, reason = float(r["Close"]), "EOD_SQUAREOFF"
+            if px is None:                  # no data at all: scratch flat
+                px, reason = float(row["Entry"]), "EOD_SQUAREOFF"
+            close_row(row, px, "15:05", reason, now)
+            stale += 1
+    return graded, stale
+
+
+def force_close_eod(rows, bars, daily, day, now):
+    """WRAP sweep: close every OPEN row of today at the last traded price."""
+    closed = 0
+    for row in rows:
+        if row.get("Status") != "OPEN" or row.get("Date") != str(day):
+            continue
+        sym = row.get("Symbol", "") + ".NS"
+        px, tlabel = None, None
+        b = bars.get(sym)
+        if b is not None and len(b):
+            px = float(b["Close"].iloc[-1])
+            tlabel = f"{b.index[-1]:%H:%M}"
+        else:
+            d = daily.get(sym)
+            if d is not None and len(d):
+                idx = pd.to_datetime(d.index)
+                try:
+                    idx = idx.tz_localize(None)
+                except (TypeError, AttributeError):
+                    pass
+                d2 = d[[t.date() == day for t in idx]]
+                if len(d2):
+                    px = float(d2.iloc[-1]["Close"])
+        if px is None:
+            px = float(row["Entry"])
+        close_row(row, px, tlabel or "15:05", "EOD_SQUAREOFF", now)
+        closed += 1
+    return closed
+
+
+def breaker_state(rows, day):
+    """Circuit breaker computed from CLOSED rows only (naturally sticky:
+    closed rows never change). Triggers: day P/L <= -2R, or 2 consecutive
+    losses. Returns (tripped, note)."""
+    todays = sorted([r for r in rows
+                     if r.get("Date") == str(day) and r.get("Status") == "CLOSED"],
+                    key=lambda r: r.get("ExitTime") or "")
+    realized = sum(float(r["PnL_R"]) for r in todays if r.get("PnL_R"))
+    streak = 0
+    for r in reversed(todays):
+        if r.get("Result") == "LOSS":
+            streak += 1
+        else:
+            break
+    parts = []
+    if realized <= -DAILY_LOSS_R - 1e-9:
+        parts.append(f"day limit -{DAILY_LOSS_R:g}R")
+    if streak >= LOSS_STREAK_TRIP:
+        parts.append(f"{streak}-loss streak")
+    if parts:
+        return True, "circuit breaker: " + " / ".join(parts)
+    return False, ""
+
+
+def upsert_daily_summary(ds_rows, tj_rows, day):
+    """One evolving row per day in daily_summary.csv."""
+    todays = [r for r in tj_rows if r.get("Date") == str(day)]
+    closed = [r for r in todays if r.get("Status") == "CLOSED"]
+    wins = sum(1 for r in closed if r.get("Result") == "WIN")
+    losses = sum(1 for r in closed if r.get("Result") == "LOSS")
+    flats = sum(1 for r in closed if r.get("Result") == "FLAT")
+    netr = round(sum(float(r["PnL_R"]) for r in closed), 3)
+    netamt = round(sum(float(r["PnL_Amt"]) for r in closed), 2)
+    wr = round(100.0 * wins / len(closed), 1) if closed else 0.0
+    tripped, note = breaker_state(tj_rows, day)
+    row = {"Date": str(day), "Trades": len(todays), "Wins": wins,
+           "Losses": losses, "Flats": flats, "Open": len(todays) - len(closed),
+           "WinRatePct": f"{wr:.1f}", "NetR": _fmt_signed(netr, 3),
+           "NetPnlAmt": _fmt_signed(netamt, 2),
+           "BreakerTripped": "YES" if tripped else "NO",
+           "DayVerdict": "FAILED" if tripped else "PASSED",
+           "Notes": note if tripped else
+                    ("" if todays else "no qualifying setups today")}
+    for i, r in enumerate(ds_rows):
+        if r.get("Date") == str(day):
+            ds_rows[i] = row
+            break
+    else:
+        ds_rows.append(row)
+    ds_rows.sort(key=lambda r: r.get("Date", ""))
+
+
+def journal_status(rows, day, tripped, bnote):
+    """Short journal block appended to every live-scan report."""
+    todays = [r for r in rows if r.get("Date") == str(day)]
+    closed = [r for r in todays if r.get("Status") == "CLOSED"]
+    open_n = len(todays) - len(closed)
+    wins = sum(1 for r in closed if r.get("Result") == "WIN")
+    losses = sum(1 for r in closed if r.get("Result") == "LOSS")
+    netr = sum(float(r["PnL_R"]) for r in closed if r.get("PnL_R"))
+    line = (f"Journal today: {len(todays)} signal(s) | open {open_n} | "
+            f"closed {len(closed)} ({wins}W/{losses}L) | "
+            f"day P/L {_fmt_signed(netr, 3)}R")
+    if tripped:
+        line += " | BREAKER: " + bnote
+    return [line]
+
+
+def journal_lines(rows, day, tripped, bnote):
+    """Detailed per-trade block for the WRAP report."""
+    todays = [r for r in rows if r.get("Date") == str(day)]
+    if not todays:
+        return ["No signals fired today - nothing to journal."]
+    out = [f"Journaled today: {len(todays)} signal(s)."]
+    for r in todays:
+        if r.get("Status") == "CLOSED":
+            out.append(f"  {r['TradeID']}: entry {r['Entry']} -> exit "
+                       f"{r['ExitPrice']} | {r['Result']} {r['PnL_R']}R "
+                       f"({r['ExitReason']})")
+        else:
+            out.append(f"  {r['TradeID']}: entry {r['Entry']} | still OPEN")
+    closed = [r for r in todays if r.get("Status") == "CLOSED"]
+    netr = sum(float(r["PnL_R"]) for r in closed if r.get("PnL_R"))
+    out.append(f"Day P/L: {_fmt_signed(netr, 3)}R | breaker: "
+               + (f"YES ({bnote})" if tripped else "no"))
+    return out
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -489,6 +797,14 @@ def main():
                 f["apct"] = atr_pct_daily(d)
                 ctx[s] = f
 
+    # ---- trade journal: load, grade open rows, circuit breaker ----
+    tj_rows = read_csv_rows(TJ_FILE)
+    ds_rows = read_csv_rows(DS_FILE)
+    graded, stale = monitor_journal(tj_rows, bars, daily, day, now)
+    if graded or stale:
+        print(f"journal: graded {graded} row(s) today, closed {stale} stale row(s)")
+    tripped, bnote = breaker_state(tj_rows, day)
+
     lines = [f"# NSE F&O Scanner - {day:%d %b %Y} {now:%H:%M} IST (phase {ph})",
              "", f"NIFTY intraday side: {'UP' if nifty_side > 0 else 'DOWN' if nifty_side < 0 else 'FLAT/NA'}"
              f"  |  universe scanned: {len(bars)} stocks", ""]
@@ -512,6 +828,16 @@ def main():
                      (", ".join(sorted(nr7)) or "none"))
         lines.append("")
         lines.append("Wait for 09:30. The LIVE sweep will start flagging S1-S4 setups after that.")
+        if stale:
+            lines += ["", f"Journal: force-closed {stale} stale open signal(s) left "
+                          "over from earlier sessions (graded on daily candles)."]
+    elif ph == "WRAP":
+        lines += ["## Square-off window (WRAP)", ""]
+        force_close_eod(tj_rows, bars, daily, day, now)
+        tripped, bnote = breaker_state(tj_rows, day)
+        lines += journal_lines(tj_rows, day, tripped, bnote)
+        lines += ["", "Square off any open MIS positions now. The broker auto "
+                      "square-off follows; never widen a stop."]
     else:
         lines += ["## Strategy signals (live scan)", ""]
         found = []
@@ -538,6 +864,21 @@ def main():
         with open(STATE_FILE, "w") as fh:
             json.dump(state, fh)
 
+        # Journal newly fired signals unless the circuit breaker is tripped.
+        journaled = 0
+        if tripped:
+            lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups are watch-only: "
+                      "take nothing new today; manage open positions normally.", ""]
+        else:
+            for r in take:
+                try:
+                    side = "LONG" if r["target"] > r["entry"] else "SHORT"
+                    tid = unique_trade_id(tj_rows, day, r["symbol"], side)
+                    tj_rows.append(signal_to_row(r, day, now, tid))
+                    journaled += 1
+                except Exception as exc:
+                    print("journal append failed:", exc)
+
         if found:
             fresh = {r["key"] for r in take}
             lines += [card(r, r["key"] in fresh) for r in
@@ -545,12 +886,18 @@ def main():
         else:
             lines.append("No qualifying setups right now.")
         lines += ["", f"Signals detected this run: {len(found)}; "
-                      f"new today: {len(new)} (reporting cap {MAX_SIGNALS}/run)."]
+                      f"new today: {len(new)} (reporting cap {MAX_SIGNALS}/run); "
+                      f"journaled this run: {journaled}."]
+        lines += journal_status(tj_rows, day, tripped, bnote)
         lines += ["", "Execution rules: place a bracket order (entry + SL + 5R target) "
                       "or a market/limit entry plus a separate SL-M order. "
                       "If neither level hits by 14:45, square off by 15:05. "
                       "Never widen a stop. Never take a second entry in the same "
                       "stock on the same strategy today."]
+
+    upsert_daily_summary(ds_rows, tj_rows, day)
+    write_csv_rows(TJ_FILE, TJ_COLS, tj_rows)
+    write_csv_rows(DS_FILE, DS_COLS, ds_rows)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     write_report(os.path.join(REPORTS_DIR, f"report_{day:%Y-%m-%d}.md"), lines)
