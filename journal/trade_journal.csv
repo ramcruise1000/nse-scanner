@@ -1,0 +1,1 @@
+TradeID,Date,SignalTime,Symbol,Direction,Setup,Entry,StopLoss,Target,Qty,RiskPerShare,RiskAmt,RewardAmt,RR,Status,ExitPrice,ExitTime,ExitReason,Result,PnL_R,PnL_Amt,UpdatedAt,Notes
