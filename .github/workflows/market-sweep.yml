@@ -5,18 +5,18 @@ name: market-sweep
 # "*/10 3-9 * * 1-5" fires every 10 minutes from 03:00 to 09:50 UTC,
 # which is 08:30 to 15:20 IST, Monday to Friday.
 # The scanner script reads the IST clock itself and exits quickly
-# whenever there is nothing to do, so extra firings cost ~10 seconds[cite: 28].
+# whenever there is nothing to do, so extra firings cost ~10 seconds.
 
 on:
   schedule:
     - cron: "*/10 3-9 * * 1-5"
-  workflow_dispatch: {}   # the manual "Run workflow" button[cite: 29]
+  workflow_dispatch: {}   # the manual "Run workflow" button
 
 permissions:
-  contents: write         # needed to commit the reports[cite: 29]
+  contents: write         # needed to commit the reports
 
 concurrency:
-  group: market-sweep     # never run two sweeps at once[cite: 29]
+  group: market-sweep     # never run two sweeps at once
   cancel-in-progress: false
 
 jobs:
@@ -25,23 +25,23 @@ jobs:
     timeout-minutes: 12
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4[cite: 29]
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5[cite: 29]
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"[cite: 29]
+          python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt[cite: 29]
+        run: pip install -r requirements.txt
 
       - name: Run the scanner
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}[cite: 29]
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}[cite: 29]
-        run: python scanner.py[cite: 29]
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
 
       - name: Commit the reports
-        uses: stefanzweifel/git-auto-commit-action@v5[cite: 29]
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "scanner run [skip ci]"[cite: 29]
+          commit_message: "scanner run [skip ci]"
