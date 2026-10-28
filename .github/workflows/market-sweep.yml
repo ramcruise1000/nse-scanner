@@ -3,13 +3,16 @@ name: market-sweep
 # NSE F&O Intraday Scanner (SOP Volume IV)
 # GitHub cron is ALWAYS in UTC. IST = UTC + 5:30.
 # "*/10 3-9 * * 1-5" fires every 10 minutes from 03:00 to 09:50 UTC,
-# which is 08:30 to 15:20 IST, Monday to Friday.
+# which is 08:30 to 15:20 IST, Monday to Friday. The second cron adds
+# 10:05 and 10:15 UTC (15:35 / 15:45 IST) so the end-of-day journal
+# close still runs even when GitHub skips or delays the last firings.
 # The scanner script reads the IST clock itself and exits quickly
 # whenever there is nothing to do, so extra firings cost ~10 seconds.
 
 on:
   schedule:
-    - cron: "*/10 3-9 * * 1-5"
+    - cron: "*/10 3-9 * * 1-5"   # 08:30-15:20 IST every 10 min
+    - cron: "5,15 10 * * 1-5"    # 15:35 + 15:45 IST journal close safety
   workflow_dispatch: {}   # the manual "Run workflow" button
 
 permissions:
