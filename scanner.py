@@ -5,8 +5,10 @@ NSE F&O Intraday Scanner - SOP Volume IV (strict 1:5 reward:risk)
 Scans the NSE F&O cash universe for four intraday setups. Writes a
 Markdown report, sends Telegram alerts, and maintains a self-updating
 trade journal (journal/trade_journal.csv + journal/daily_summary.csv)
-with automatic exit grading, EOD square-off rows and a -2R circuit
-breaker that stops new signal journaling for the rest of the day.
+with automatic exit grading, a Remarks column that narrates the exact
+entry trigger price and the exit trigger time (stop, target or the
+15:05 auto square-off), and a -2R circuit breaker that stops new
+signal journaling for the rest of the day.
 
 Strategies
   S1  Opening Range Breakout (09:15-09:30 range) to a strict 5R target
@@ -15,12 +17,15 @@ Strategies
   S4  NR7 / Inside-Day range expansion (yesterday's contraction)
 
 This script runs inside GitHub Actions every 10 minutes between 08:30
-and 15:20 IST, Monday-Friday. It reads the IST clock itself:
+and 15:45 IST, Monday-Friday. It reads the IST clock itself:
 
   before 09:20        -> exits silently (nothing to do yet)
   09:20 - 09:29 PREP  -> pre-market watchlist (gaps, NR7/inside-day names)
   09:30 - 14:29 LIVE  -> full strategy scan
-  14:30 - 15:20 WRAP  -> square-off reminder
+  14:30 - 15:45 WRAP  -> keeps grading open rows; force-closes whatever
+                         is still open at the 15:05+ sweep (auto square-off).
+                         Extended past 15:20 so GitHub cron delays/skips
+                         cannot strand a row overnight.
   weekends / holidays -> exits (no fresh market data)
 
 Data source: Yahoo Finance via the free `yfinance` library (no API key).
@@ -87,8 +92,8 @@ def phase_of(now):
         return "PREP"
     if dt.time(9, 30) <= t < dt.time(14, 30):
         return "LIVE"
-    if dt.time(14, 30) <= t <= dt.time(15, 20):
-        return "WRAP"
+    if dt.time(14, 30) <= t <= dt.time(15, 45):   # 15:20 -> 15:45: cron-delay
+        return "WRAP"                             # safety for the EOD close
     return None
 
 
@@ -456,11 +461,14 @@ DS_FILE = os.path.join(JOURNAL_DIR, "daily_summary.csv")
 DAILY_LOSS_R = 2.0        # circuit breaker: day P/L that trips the breaker
 LOSS_STREAK_TRIP = 2      # circuit breaker: consecutive losses that trip it
 RR_LABEL = "1:5"
+SQUAREOFF_GATE = dt.time(15, 5)   # WRAP keeps grading until 15:05 IST
+REMARK_EXIT_LABELS = {"STOP_HIT": "STOP HIT", "TARGET_HIT": "TARGET HIT",
+                      "EOD_SQUAREOFF": "AUTO SQUARE-OFF"}
 
 TJ_COLS = ("TradeID", "Date", "SignalTime", "Symbol", "Direction", "Setup",
            "Entry", "StopLoss", "Target", "Qty", "RiskPerShare", "RiskAmt",
            "RewardAmt", "RR", "Status", "ExitPrice", "ExitTime", "ExitReason",
-           "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Notes")
+           "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Remarks", "Notes")
 DS_COLS = ("Date", "Trades", "Wins", "Losses", "Flats", "Open", "WinRatePct",
            "NetR", "NetPnlAmt", "BreakerTripped", "DayVerdict", "Notes")
 SETUP_NAMES = {"S1": "S1_ORB_BREAKOUT", "S2": "S2_VWAP_PULLBACK",
@@ -503,6 +511,39 @@ def unique_trade_id(rows, day, sym, side):
     return tid
 
 
+def entry_remark(entry, signal_time):
+    """First half of the Remarks narrative (written when the row opens)."""
+    return f"Entry triggered @ {entry} at {signal_time} IST"
+
+
+def exit_remark(reason, px, exit_time, pnl_r):
+    """Second half of the Remarks narrative (appended when the row closes)."""
+    label = REMARK_EXIT_LABELS.get(reason, reason)
+    return f"{label} @ {px} at {exit_time} IST ({pnl_r:+.2f}R)"
+
+
+def backfill_remarks(rows):
+    """Rebuild the Remarks narrative for rows written by an older journal
+    version (idempotent: rows that already carry Remarks are untouched)."""
+    n = 0
+    for r in rows:
+        if r.get("Remarks") or not r.get("Entry"):
+            continue
+        txt = entry_remark(r["Entry"], r.get("SignalTime") or "?")
+        if r.get("Status") == "CLOSED" and r.get("ExitPrice"):
+            reason = r.get("ExitReason") or "EXIT"
+            label = REMARK_EXIT_LABELS.get(reason, reason)
+            try:
+                pnl = f" ({float(r['PnL_R']):+.2f}R)" if r.get("PnL_R") else ""
+            except ValueError:
+                pnl = ""
+            txt += (f"; {label} @ {r['ExitPrice']} at "
+                    f"{r.get('ExitTime') or '?'} IST{pnl}")
+        r["Remarks"] = txt
+        n += 1
+    return n
+
+
 def signal_to_row(sig, day, now, trade_id):
     """Turn a fired signal into an OPEN journal row."""
     side = "LONG" if sig["target"] > sig["entry"] else "SHORT"
@@ -527,12 +568,15 @@ def signal_to_row(sig, day, now, trade_id):
         "ExitPrice": "", "ExitTime": "", "ExitReason": "",
         "Result": "", "PnL_R": "", "PnL_Amt": "",
         "UpdatedAt": f"{now:%Y-%m-%d %H:%M:%S}",
+        "Remarks": entry_remark(f"{sig['entry']:.2f}", f"{now:%H:%M}"),
         "Notes": sig.get("why", ""),
     }
 
 
-def close_row(row, px, exit_time, reason, now):
-    """Grade one row at an exit price and stamp the audit columns."""
+def close_row(row, px, exit_time, reason, now, remark_note=""):
+    """Grade one row at an exit price, stamp the audit columns and append
+    the exit narrative to Remarks. remark_note adds an honesty suffix
+    (e.g. 'graded on daily candle' for stale rows)."""
     sign = 1.0 if row["Direction"] == "LONG" else -1.0
     entry = float(row["Entry"])
     rps = float(row["RiskPerShare"]) or 1e-9
@@ -547,6 +591,10 @@ def close_row(row, px, exit_time, reason, now):
     row["Result"] = ("WIN" if pnl_r > 0.0005
                      else ("LOSS" if pnl_r < -0.0005 else "FLAT"))
     row["UpdatedAt"] = f"{now:%Y-%m-%d %H:%M:%S}"
+    base = row.get("Remarks") or entry_remark(
+        row.get("Entry", ""), row.get("SignalTime") or "?")
+    tail = f" ({remark_note})" if remark_note else ""
+    row["Remarks"] = f"{base}; {exit_remark(reason, f'{px:.2f}', exit_time, pnl_r)}{tail}"
 
 
 def _bar_hit(row, hi, lo):
@@ -557,9 +605,44 @@ def _bar_hit(row, hi, lo):
     return hi >= sl - 1e-9, lo <= tg + 1e-9
 
 
-def monitor_journal(rows, bars, daily, day, now):
-    """Grade OPEN rows: today's rows against completed 5-min bars, rows
-    stranded from earlier sessions against that date's daily candle.
+def _intraday_for_date(intra, sym, rdate):
+    """One past session's 5-minute bars for a symbol, or None.
+    yfinance keeps roughly five sessions of 5-minute history."""
+    if not intra:
+        return None
+    raw = intra.get(sym)
+    if raw is None or not len(raw):
+        return None
+    df = raw.copy()
+    try:
+        df.index = df.index.tz_convert(IST)
+    except (TypeError, AttributeError):
+        pass
+    df = df[[str(t.date()) == rdate for t in df.index]]
+    return df.sort_index() if len(df) else None
+
+
+def _first_touch(row, bb):
+    """Walk completed bars chronologically; return (px, timestamp, reason)
+    for the first bar touching stop or target (stop-first inside one bar),
+    or None."""
+    for ts, br in bb.iterrows():
+        hit_stop, hit_tgt = _bar_hit(row, float(br["High"]),
+                                     float(br["Low"]))
+        if hit_stop:
+            return float(row["StopLoss"]), ts, "STOP_HIT"
+        if hit_tgt:
+            return float(row["Target"]), ts, "TARGET_HIT"
+    return None
+
+
+def monitor_journal(rows, bars, daily, day, now, intra=None):
+    """Grade OPEN rows. Today's rows are checked against completed 5-min
+    bars every sweep. Rows stranded from earlier sessions are re-graded
+    on THAT DATE's own 5-minute bars (exact trigger price and time), and
+    only fall back to the daily candle once the intraday history has
+    expired - the daily candle cannot reveal intraday order, so there the
+    stop wins conservatively if both levels sit inside the day's range.
     Returns (graded_today, stale_closed)."""
     graded = stale = 0
     for row in rows:
@@ -576,42 +659,52 @@ def monitor_journal(rows, bars, daily, day, now):
             except ValueError:
                 hh, mm = 9, 15
             bb = b[[t.time() >= dt.time(hh, mm) for t in b.index]]
-            hit = None
-            for ts, br in bb.iterrows():
-                hit_stop, hit_tgt = _bar_hit(row, float(br["High"]),
-                                             float(br["Low"]))
-                if hit_stop:
-                    hit = (float(row["StopLoss"]), ts, "STOP_HIT")
-                    break
-                if hit_tgt:
-                    hit = (float(row["Target"]), ts, "TARGET_HIT")
-                    break
+            hit = _first_touch(row, bb)
             if hit:
                 close_row(row, hit[0], f"{hit[1]:%H:%M}", hit[2], now)
                 graded += 1
         else:
-            px, reason = None, None
-            d = daily.get(sym)
-            if d is not None and len(d):
-                idx = pd.to_datetime(d.index)
+            px = reason = tlabel = None
+            note = "graded on daily candle"
+            b5 = _intraday_for_date(intra, sym, rdate)
+            if b5 is not None and len(b5):
                 try:
-                    idx = idx.tz_localize(None)
-                except (TypeError, AttributeError):
-                    pass
-                d2 = d[[str(t.date()) == rdate for t in idx]]
-                if len(d2):
-                    r = d2.iloc[-1]
-                    hit_stop, hit_tgt = _bar_hit(row, float(r["High"]),
-                                                 float(r["Low"]))
-                    if hit_stop:
-                        px, reason = float(row["StopLoss"]), "STOP_HIT"
-                    elif hit_tgt:
-                        px, reason = float(row["Target"]), "TARGET_HIT"
-                    else:
-                        px, reason = float(r["Close"]), "EOD_SQUAREOFF"
-            if px is None:                  # no data at all: scratch flat
-                px, reason = float(row["Entry"]), "EOD_SQUAREOFF"
-            close_row(row, px, "15:05", reason, now)
+                    hh, mm = map(int,
+                                 str(row.get("SignalTime", "9:15")).split(":"))
+                except ValueError:
+                    hh, mm = 9, 15
+                bb = b5[[t.time() >= dt.time(hh, mm) for t in b5.index]]
+                hit = _first_touch(row, bb)
+                if hit:
+                    px, reason, tlabel = hit[0], hit[2], f"{hit[1]:%H:%M}"
+                else:
+                    px = float(b5["Close"].iloc[-1])
+                    reason = "EOD_SQUAREOFF"
+                    tlabel = f"{b5.index[-1]:%H:%M}"
+                note = ""
+            if px is None:
+                d = daily.get(sym)
+                if d is not None and len(d):
+                    idx = pd.to_datetime(d.index)
+                    try:
+                        idx = idx.tz_localize(None)
+                    except (TypeError, AttributeError):
+                        pass
+                    d2 = d[[str(t.date()) == rdate for t in idx]]
+                    if len(d2):
+                        r = d2.iloc[-1]
+                        hit_stop, hit_tgt = _bar_hit(row, float(r["High"]),
+                                                     float(r["Low"]))
+                        if hit_stop:
+                            px, reason = float(row["StopLoss"]), "STOP_HIT"
+                        elif hit_tgt:
+                            px, reason = float(row["Target"]), "TARGET_HIT"
+                        else:
+                            px, reason = float(r["Close"]), "EOD_SQUAREOFF"
+                if px is None:              # no data at all: scratch flat
+                    px, reason = float(row["Entry"]), "EOD_SQUAREOFF"
+                tlabel = "15:05"
+            close_row(row, px, tlabel, reason, now, remark_note=note)
             stale += 1
     return graded, stale
 
@@ -780,9 +873,10 @@ def main():
             nifty_side = 1 if c > float(nv.iloc[-1]) else -1
 
     ctx, bars, vwaps = {}, {}, {}
+    minb = 1 if ph == "PREP" else 6   # PREP only needs the first bar (gaps)
     for s in intra:
         b = completed_bars(intra[s], day, now)
-        if len(b) < 6 or float(b["Volume"].sum()) <= 0:
+        if len(b) < minb or float(b["Volume"].sum()) <= 0:
             continue
         bars[s] = b
         vwaps[s] = vwap_of(b)
@@ -799,8 +893,10 @@ def main():
 
     # ---- trade journal: load, grade open rows, circuit breaker ----
     tj_rows = read_csv_rows(TJ_FILE)
+    backfill_remarks(tj_rows)          # fill Remarks for pre-upgrade rows
     ds_rows = read_csv_rows(DS_FILE)
-    graded, stale = monitor_journal(tj_rows, bars, daily, day, now)
+    graded, stale = monitor_journal(tj_rows, bars, daily, day, now,
+                                    intra=intra)
     if graded or stale:
         print(f"journal: graded {graded} row(s) today, closed {stale} stale row(s)")
     tripped, bnote = breaker_state(tj_rows, day)
@@ -833,7 +929,18 @@ def main():
                           "over from earlier sessions (graded on daily candles)."]
     elif ph == "WRAP":
         lines += ["## Square-off window (WRAP)", ""]
-        force_close_eod(tj_rows, bars, daily, day, now)
+        auto_closed = 0
+        if now.time() >= SQUAREOFF_GATE:
+            auto_closed = force_close_eod(tj_rows, bars, daily, day, now)
+            if auto_closed:
+                lines.append(f"Auto square-off: force-closed {auto_closed} "
+                             "signal(s) still open at 15:05 (last traded "
+                             "price, ExitReason=EOD_SQUAREOFF).")
+                lines.append("")
+        else:
+            lines.append("Before 15:05 - stop and target levels are still "
+                         "live; the journal keeps grading on every sweep.")
+            lines.append("")
         tripped, bnote = breaker_state(tj_rows, day)
         lines += journal_lines(tj_rows, day, tripped, bnote)
         lines += ["", "Square off any open MIS positions now. The broker auto "
