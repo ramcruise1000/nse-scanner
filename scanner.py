@@ -16,6 +16,15 @@ Strategies
   S3  Supertrend (10,3) 15-min flip continuation
   S4  NR7 / Inside-Day range expansion (yesterday's contraction)
 
+A multi-factor NIFTY intraday regime engine (VWAP position, day-open
+position, 30-min market structure, 1-hour momentum, reversal
+retracement, fresh VWAP reclaim/loss) re-grades the index on EVERY
+sweep: UP unlocks longs only, DOWN unlocks shorts only, NEUTRAL lets
+both sides through to the stock-level filters. This replaces the old
+single "close vs VWAP" flag that stayed DOWN for hours after a morning
+selloff even after the index had visibly reversed (V-bottom days left
+no buy setups and kept shorting into strength).
+
 This script runs inside GitHub Actions every 10 minutes between 08:30
 and 15:45 IST, Monday-Friday. It reads the IST clock itself:
 
@@ -63,6 +72,13 @@ REACH_FRAC    = 1.00    # 5R target must fit inside ATR(14) daily range
 MAX_SIGNALS   = 3       # max new signals reported per run
 COST_RS       = 60      # estimated round-trip cost per trade (reporting only)
 MARGIN_MULT   = 5       # SEBI intraday (MIS) leverage ceiling for sizing cap
+
+# --- NIFTY intraday regime engine (recomputed on every sweep) ---
+REG_MOMO_TH  = 0.0012   # 1-hour NIFTY rate-of-change threshold (0.12%)
+REG_MOVE_TH  = 0.002    # min open->extreme move (0.2%) for the retrace vote
+REG_RETRACE  = 0.5      # retrace fraction of that move to flag a reversal
+REG_SCORE_TH = 2        # |net votes| needed for a directional regime
+REG_NAME     = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}
 
 IST = ZoneInfo("Asia/Kolkata")   # NSE runs on India Standard Time (UTC+5:30)
 
@@ -150,8 +166,15 @@ def completed_bars(df, day, now, minutes=5):
 # ------------------------------------------------------------------
 
 def vwap_of(bars):
-    """Session VWAP series (typical price weighted by volume)."""
+    """Session VWAP series (typical price weighted by volume). Yahoo's
+    intraday INDEX data (^NSEI) carries zero volume, which makes a naive
+    VWAP NaN for the whole session - and NaN comparisons silently read as
+    'index bearish' everywhere. Fall back to the unweighted expanding
+    mean of typical prices so the NIFTY regime engine always gets a live
+    reference line. Stock bars keep true volume weighting."""
     tp = (bars["High"] + bars["Low"] + bars["Close"]) / 3.0
+    if len(bars) and float(bars["Volume"].sum()) <= 0:
+        return tp.expanding().mean()
     pv = (tp * bars["Volume"]).cumsum()
     v = bars["Volume"].cumsum()
     v = v.where(v > 0)
@@ -190,6 +213,128 @@ def supertrend(df, period=10, mult=3.0):
     out = df.copy()
     out["st"], out["dir"] = st, dr
     return out
+
+
+# ------------------------------------------------------------------
+# Intraday regime engine - NIFTY strength/weakness, recomputed on
+# EVERY sweep from completed 5-minute bars. Six votes, each
+# -1 / 0 / +1:
+#   vwap    close vs session VWAP
+#   open    close vs the day's opening print
+#   struct  last 6 bars vs prior 6 (HH+HL vs LH+LL)
+#   momo    1-hour rate of change beyond +/-0.12%
+#   retrace >=50% pullback off a >=0.2% open->extreme move (reversal)
+#   reclaim fresh VWAP reclaim / loss inside the last hour
+# Net score >= +2 -> UP (longs only), <= -2 -> DOWN (shorts only),
+# in between -> NEUTRAL (both sides allowed; the stock-level filters
+# in S1-S4 still decide). A one-tick hysteresis band (a held regime
+# releases only when the score crosses 0) stops UP<->NEUTRAL flapping
+# on marginal sweeps.
+# ------------------------------------------------------------------
+
+def regime_votes(nb, nv):
+    """The six -1/0/+1 votes. nb = completed 5-min NIFTY bars,
+    nv = their session VWAP series."""
+    closes = nb["Close"].astype(float)
+    n, c = len(nb), float(nb["Close"].iloc[-1])
+    v = {}
+
+    vw = float(nv.iloc[-1])
+    v["vwap"] = 0 if math.isnan(vw) else (1 if c > vw else -1 if c < vw else 0)
+
+    op = float(nb["Open"].iloc[0])
+    v["open"] = 1 if c > op else -1 if c < op else 0
+
+    v["struct"] = 0
+    if n >= 12:
+        w1, w0 = nb.iloc[-6:], nb.iloc[-12:-6]
+        hh = float(w1["High"].max()) > float(w0["High"].max())
+        hl = float(w1["Low"].min()) > float(w0["Low"].min())
+        lh = float(w1["High"].max()) < float(w0["High"].max())
+        ll = float(w1["Low"].min()) < float(w0["Low"].min())
+        if hh and hl:
+            v["struct"] = 1
+        elif lh and ll:
+            v["struct"] = -1
+
+    v["momo"] = 0
+    if n >= 13:
+        roc = c / float(closes.iloc[-13]) - 1.0
+        if roc > REG_MOMO_TH:
+            v["momo"] = 1
+        elif roc < -REG_MOMO_TH:
+            v["momo"] = -1
+
+    v["retrace"] = 0
+    lo, hi = float(nb["Low"].min()), float(nb["High"].max())
+    if op > 0:
+        drop = (op - lo) / op
+        if drop >= REG_MOVE_TH and (c - lo) / (op - lo) >= REG_RETRACE:
+            v["retrace"] += 1          # fell hard, then recovered the move
+        rise = (hi - op) / op
+        if rise >= REG_MOVE_TH and (hi - c) / (hi - op) >= REG_RETRACE:
+            v["retrace"] -= 1          # rallied hard, then gave it back
+
+    v["reclaim"] = 0
+    if n >= 13:
+        d = (closes - nv.astype(float)).dropna()
+        w = d.iloc[-13:].values
+        if len(w) >= 2:                      # all-NaN VWAP guard
+            up = [i for i in range(1, len(w)) if w[i - 1] <= 0 < w[i]]
+            dn = [i for i in range(1, len(w)) if w[i - 1] >= 0 > w[i]]
+            if w[-1] > 0 and up and (not dn or up[-1] > dn[-1]):
+                v["reclaim"] = 1           # reclaimed VWAP inside the last hour
+            elif w[-1] < 0 and dn and (not up or dn[-1] > up[-1]):
+                v["reclaim"] = -1          # lost VWAP inside the last hour
+    return v
+
+
+def nifty_regime(nb, nv, day):
+    """Composite intraday regime. Returns (side, score, report line).
+    side: +1 UP (longs only), -1 DOWN (shorts only), 0 NEUTRAL (both
+    allowed). The resolved regime is persisted in state.json with a
+    one-tick hysteresis band so marginal sweeps cannot flip it."""
+    if nb is None or len(nb) == 0:
+        return 0, 0, "NIFTY regime: NA (no index bars)"
+    votes = regime_votes(nb, nv)
+    score = sum(votes.values())
+    raw = 1 if score >= REG_SCORE_TH else (-1 if score <= -REG_SCORE_TH else 0)
+    prev = load_regime(day)
+    if prev == "UP" and score >= REG_SCORE_TH - 1:
+        side = 1
+    elif prev == "DOWN" and score <= -(REG_SCORE_TH - 1):
+        side = -1
+    else:
+        side = raw
+    save_regime(day, REG_NAME[side])
+    vv = " ".join(f"{k}{'+' if x > 0 else '-' if x < 0 else '0'}"
+                  for k, x in votes.items())
+    held = "  [held]" if side != raw else ""
+    line = (f"NIFTY regime: {REG_NAME[side]} (score {score:+d}; votes {vv})"
+            f"{held}  -  UP=longs only, DOWN=shorts only, NEUTRAL=both")
+    return side, score, line
+
+
+def load_regime(day):
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+        if st.get("date") == str(day):
+            return st.get("regime")
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def save_regime(day, name):
+    st = load_state(day)
+    if st.get("regime") != name:
+        st["regime"] = name
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(st, f)
+        except OSError:
+            pass
 
 
 def atr_pct_daily(daily, n=14):
@@ -511,9 +656,13 @@ def unique_trade_id(rows, day, sym, side):
     return tid
 
 
-def entry_remark(entry, signal_time):
-    """First half of the Remarks narrative (written when the row opens)."""
-    return f"Entry triggered @ {entry} at {signal_time} IST"
+def entry_remark(entry, signal_time, regime=""):
+    """First half of the Remarks narrative (written when the row opens).
+    regime appends the NIFTY regime snapshot at fire time for audit."""
+    txt = f"Entry triggered @ {entry} at {signal_time} IST"
+    if regime:
+        txt += f" | {regime}"
+    return txt
 
 
 def exit_remark(reason, px, exit_time, pnl_r):
@@ -568,7 +717,8 @@ def signal_to_row(sig, day, now, trade_id):
         "ExitPrice": "", "ExitTime": "", "ExitReason": "",
         "Result": "", "PnL_R": "", "PnL_Amt": "",
         "UpdatedAt": f"{now:%Y-%m-%d %H:%M:%S}",
-        "Remarks": entry_remark(f"{sig['entry']:.2f}", f"{now:%H:%M}"),
+        "Remarks": entry_remark(f"{sig['entry']:.2f}", f"{now:%H:%M}",
+                                sig.get("regime", "")),
         "Notes": sig.get("why", ""),
     }
 
@@ -864,13 +1014,13 @@ def main():
         print("No data returned at all - exiting.")
         return
 
-    nifty_side = 0
+    nifty_side, nifty_score = 0, 0
+    nifty_tag = "NIFTY regime: NA (no index data yet)"
     if nifty is not None:
         nb = completed_bars(nifty, day, now)
         if len(nb):
-            nv = vwap_of(nb)
-            c = float(nb["Close"].iloc[-1])
-            nifty_side = 1 if c > float(nv.iloc[-1]) else -1
+            nifty_side, nifty_score, nifty_tag = nifty_regime(
+                nb, vwap_of(nb), day)
 
     ctx, bars, vwaps = {}, {}, {}
     minb = 1 if ph == "PREP" else 6   # PREP only needs the first bar (gaps)
@@ -902,8 +1052,7 @@ def main():
     tripped, bnote = breaker_state(tj_rows, day)
 
     lines = [f"# NSE F&O Scanner - {day:%d %b %Y} {now:%H:%M} IST (phase {ph})",
-             "", f"NIFTY intraday side: {'UP' if nifty_side > 0 else 'DOWN' if nifty_side < 0 else 'FLAT/NA'}"
-             f"  |  universe scanned: {len(bars)} stocks", ""]
+             "", f"{nifty_tag}  |  universe scanned: {len(bars)} stocks", ""]
 
     if ph == "PREP":
         lines += ["## Pre-market watchlist (PREP phase)", ""]
@@ -979,6 +1128,8 @@ def main():
         else:
             for r in take:
                 try:
+                    r["regime"] = (f"NIFTY {REG_NAME[nifty_side]} "
+                                   f"(score {nifty_score:+d})")
                     side = "LONG" if r["target"] > r["entry"] else "SHORT"
                     tid = unique_trade_id(tj_rows, day, r["symbol"], side)
                     tj_rows.append(signal_to_row(r, day, now, tid))
