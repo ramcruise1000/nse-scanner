@@ -19,11 +19,27 @@ Strategies
 A multi-factor NIFTY intraday regime engine (VWAP position, day-open
 position, 30-min market structure, 1-hour momentum, reversal
 retracement, fresh VWAP reclaim/loss) re-grades the index on EVERY
-sweep: UP unlocks longs only, DOWN unlocks shorts only, NEUTRAL lets
-both sides through to the stock-level filters. This replaces the old
-single "close vs VWAP" flag that stayed DOWN for hours after a morning
-selloff even after the index had visibly reversed (V-bottom days left
-no buy setups and kept shorting into strength).
+sweep and prints it in the report header. It is ADVISORY ONLY: it
+never blocks a side, because single stocks can be strong while the
+index is weak and vice versa - the stock-level filters in S1-S4
+decide every trade.
+
+Two self-correcting layers sit on top of the four strategies:
+
+  * Fill-confirmation gate (slippage log). A fired signal becomes a
+    journal trade only if price retraces to its trigger price within
+    0.10% after the signal - i.e. a limit order at the signal price
+    would really have filled. Signals whose price runs away and never
+    comes back are logged in journal/slippage_log.csv instead and
+    never pollute the win/loss statistics.
+
+  * Auto-tune engine (trend dominance). Over the last 5 trading
+    sessions every (strategy, side) bucket is graded from the journal
+    and the slippage log on every sweep: buckets with negative net R
+    (>= 2 graded fills) or chronic slippage (>= 3 runaways) are muted
+    for the rest of the day; winners keep firing. The scanner thus
+    keeps re-aligning itself with the dominant recent trend of its
+    own accuracy.
 
 This script runs inside GitHub Actions every 10 minutes between 08:30
 and 15:45 IST, Monday-Friday. It reads the IST clock itself:
@@ -79,6 +95,15 @@ REG_MOVE_TH  = 0.002    # min open->extreme move (0.2%) for the retrace vote
 REG_RETRACE  = 0.5      # retrace fraction of that move to flag a reversal
 REG_SCORE_TH = 2        # |net votes| needed for a directional regime
 REG_NAME     = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}
+
+# --- fill-confirmation gate (slippage tracking) ---
+FILL_TOL_PCT  = 0.10    # signal must retrace to within 0.10% of trigger
+FILL_DEADLINE = dt.time(15, 0)   # unfilled signals expire to slippage here
+
+# --- auto-tune engine (last-N-session win/loss dominance) ---
+AT_WINDOW_DAYS = 5      # trading sessions of history feeding the tuner
+AT_MIN_TRADES  = 2      # graded fills needed before net R can mute a bucket
+AT_SLIP_MIN    = 3      # runaway signals that mark a bucket as chronic chase
 
 IST = ZoneInfo("Asia/Kolkata")   # NSE runs on India Standard Time (UTC+5:30)
 
@@ -225,11 +250,15 @@ def supertrend(df, period=10, mult=3.0):
 #   momo    1-hour rate of change beyond +/-0.12%
 #   retrace >=50% pullback off a >=0.2% open->extreme move (reversal)
 #   reclaim fresh VWAP reclaim / loss inside the last hour
-# Net score >= +2 -> UP (longs only), <= -2 -> DOWN (shorts only),
-# in between -> NEUTRAL (both sides allowed; the stock-level filters
-# in S1-S4 still decide). A one-tick hysteresis band (a held regime
-# releases only when the score crosses 0) stops UP<->NEUTRAL flapping
-# on marginal sweeps.
+# Net score >= +2 -> UP, <= -2 -> DOWN, in between -> NEUTRAL. A one-tick
+# hysteresis band (a held regime releases only when the score crosses 0)
+# stops UP<->NEUTRAL flapping on marginal sweeps.
+#
+# The regime is ADVISORY ONLY: it is printed in every report header and
+# stamped into journal Remarks for audit, but it never blocks a side -
+# a weak tape still has strong stocks worth buying and a strong tape
+# still has weak stocks worth shorting. Stock-level filters decide, and
+# the auto-tune engine mutes whatever keeps losing or slipping.
 # ------------------------------------------------------------------
 
 def regime_votes(nb, nv):
@@ -291,9 +320,10 @@ def regime_votes(nb, nv):
 
 def nifty_regime(nb, nv, day):
     """Composite intraday regime. Returns (side, score, report line).
-    side: +1 UP (longs only), -1 DOWN (shorts only), 0 NEUTRAL (both
-    allowed). The resolved regime is persisted in state.json with a
-    one-tick hysteresis band so marginal sweeps cannot flip it."""
+    side: +1 UP, -1 DOWN, 0 NEUTRAL - ADVISORY ONLY, never a gate (a
+    weak tape still has strong stocks and vice versa). The resolved
+    regime is persisted in state.json with a one-tick hysteresis band
+    so marginal sweeps cannot flip it."""
     if nb is None or len(nb) == 0:
         return 0, 0, "NIFTY regime: NA (no index bars)"
     votes = regime_votes(nb, nv)
@@ -311,7 +341,7 @@ def nifty_regime(nb, nv, day):
                   for k, x in votes.items())
     held = "  [held]" if side != raw else ""
     line = (f"NIFTY regime: {REG_NAME[side]} (score {score:+d}; votes {vv})"
-            f"{held}  -  UP=longs only, DOWN=shorts only, NEUTRAL=both")
+            f"{held}  -  advisory only, never blocks a side")
     return side, score, line
 
 
@@ -401,8 +431,9 @@ def risk_math(entry, stop, side, apct):
 # The four strategies. Each returns a signal dict or None.
 # ------------------------------------------------------------------
 
-def sig_s1(sym, b, vwap, nifty_side, apct):
-    """S1: close beyond the 09:15-09:30 opening range with volume."""
+def sig_s1(sym, b, vwap, apct):
+    """S1: close beyond the 09:15-09:30 opening range with volume. The
+    stock's own break decides the side - never the index regime."""
     orb = b[b.index.time < dt.time(9, 30)]
     if len(orb) < 2:
         return None
@@ -418,19 +449,20 @@ def sig_s1(sym, b, vwap, nifty_side, apct):
     avg_vol = float(b["Volume"].mean()) or 1.0
     if vw is None:
         return None
-    long_ok = c > oh and c > vw and nifty_side >= 0 and vol >= 2.0 * avg_vol
-    short_ok = c < ol and c < vw and nifty_side <= 0 and vol >= 2.0 * avg_vol
+    long_ok = c > oh and c > vw and vol >= 2.0 * avg_vol
+    short_ok = c < ol and c < vw and vol >= 2.0 * avg_vol
     if long_ok:
         r = risk_math(c, ol, "LONG", apct)
     elif short_ok:
         r = risk_math(c, oh, "SHORT", apct)
     else:
         return None
-    return make_signal("S1", sym, r, "ORB break, 2x volume, VWAP/NIFTY aligned")
+    return make_signal("S1", sym, r, "ORB break, 2x volume, VWAP aligned")
 
 
-def sig_s2(sym, b, vwap, ctx, nifty_side, apct):
-    """S2: trend day pulls back to VWAP and reclaims it (both sides)."""
+def sig_s2(sym, b, vwap, ctx, apct):
+    """S2: trend day pulls back to VWAP and reclaims it (both sides,
+    decided by the stock's own open vs yesterday's close)."""
     t0 = b.index[-1].time()
     if not (dt.time(9, 45) <= t0 <= dt.time(13, 0)) or len(b) < 12:
         return None
@@ -447,7 +479,7 @@ def sig_s2(sym, b, vwap, ctx, nifty_side, apct):
         if (b["Close"] > vwap).mean() < 0.7:
             return None
         touched = float(b["Low"].iloc[-1]) <= vw and c > vw
-        if not touched or nifty_side < 0:
+        if not touched:
             return None
         stop = min(float(b["Low"].iloc[-3:].min()), c * (1 - MIN_STOP_PCT))
         r = risk_math(c, stop, "LONG", apct)
@@ -455,7 +487,7 @@ def sig_s2(sym, b, vwap, ctx, nifty_side, apct):
         if (b["Close"] < vwap).mean() < 0.7:
             return None
         touched = float(b["High"].iloc[-1]) >= vw and c < vw
-        if not touched or nifty_side > 0:
+        if not touched:
             return None
         stop = max(float(b["High"].iloc[-3:].max()), c * (1 + MIN_STOP_PCT))
         r = risk_math(c, stop, "SHORT", apct)
@@ -464,10 +496,11 @@ def sig_s2(sym, b, vwap, ctx, nifty_side, apct):
     return make_signal("S2", sym, r, "VWAP pullback rejection on trend day")
 
 
-def sig_s3(sym, b, vwap, nifty_side, apct):
+def sig_s3(sym, b, vwap, apct):
     """S3: fresh 15-min Supertrend flip with volume and VWAP support.
     Stop = the nearer of the Supertrend line and the flip candle's extreme
-    (floored/ceilinged at the 0.3% cost boundary)."""
+    (floored/ceilinged at the 0.3% cost boundary). The stock's own
+    Supertrend direction decides the side - never the index regime."""
     t0 = b.index[-1].time()
     if not (dt.time(9, 45) <= t0 <= dt.time(14, 0)) or len(b) < 40:
         return None
@@ -487,11 +520,11 @@ def sig_s3(sym, b, vwap, nifty_side, apct):
     avg_vol = float(b["Volume"].mean()) or 1.0
     if vol < 1.5 * avg_vol:
         return None
-    if d.iloc[-1] == 1 and c > vw and nifty_side >= 0:
+    if d.iloc[-1] == 1 and c > vw:
         nearer = max(float(st["st"].iloc[-1]), float(flip_bar["Low"]))
         stop = min(nearer, c * (1 - MIN_STOP_PCT))
         r = risk_math(c, stop, "LONG", apct)
-    elif d.iloc[-1] == -1 and c < vw and nifty_side <= 0:
+    elif d.iloc[-1] == -1 and c < vw:
         nearer = min(float(st["st"].iloc[-1]), float(flip_bar["High"]))
         stop = max(nearer, c * (1 + MIN_STOP_PCT))
         r = risk_math(c, stop, "SHORT", apct)
@@ -500,8 +533,9 @@ def sig_s3(sym, b, vwap, nifty_side, apct):
     return make_signal("S3", sym, r, "Supertrend(10,3) 15-min flip + volume")
 
 
-def sig_s4(sym, b, vwap, ctx, nifty_side, apct):
-    """S4: NR7 / inside-day expansion breakout through yesterday's range."""
+def sig_s4(sym, b, vwap, ctx, apct):
+    """S4: NR7 / inside-day expansion breakout through yesterday's range.
+    The stock's own breakout decides the side - never the index regime."""
     if not (ctx["nr7"] or ctx["inside"]):
         return None
     t0 = b.index[-1].time()
@@ -517,10 +551,10 @@ def sig_s4(sym, b, vwap, ctx, nifty_side, apct):
         return None
     bar_lo = float(b["Low"].iloc[-1])
     bar_hi = float(b["High"].iloc[-1])
-    if c > ctx["prev_high"] and c > vw and nifty_side >= 0:
+    if c > ctx["prev_high"] and c > vw:
         stop = min(bar_lo, c * (1 - MIN_STOP_PCT))
         r = risk_math(c, stop, "LONG", apct)
-    elif c < ctx["prev_low"] and c < vw and nifty_side <= 0:
+    elif c < ctx["prev_low"] and c < vw:
         stop = max(bar_hi, c * (1 + MIN_STOP_PCT))
         r = risk_math(c, stop, "SHORT", apct)
     else:
@@ -603,6 +637,7 @@ def card(s, new):
 JOURNAL_DIR = "journal"
 TJ_FILE = os.path.join(JOURNAL_DIR, "trade_journal.csv")
 DS_FILE = os.path.join(JOURNAL_DIR, "daily_summary.csv")
+SLIP_FILE = os.path.join(JOURNAL_DIR, "slippage_log.csv")
 DAILY_LOSS_R = 2.0        # circuit breaker: day P/L that trips the breaker
 LOSS_STREAK_TRIP = 2      # circuit breaker: consecutive losses that trip it
 RR_LABEL = "1:5"
@@ -616,6 +651,8 @@ TJ_COLS = ("TradeID", "Date", "SignalTime", "Symbol", "Direction", "Setup",
            "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Remarks", "Notes")
 DS_COLS = ("Date", "Trades", "Wins", "Losses", "Flats", "Open", "WinRatePct",
            "NetR", "NetPnlAmt", "BreakerTripped", "DayVerdict", "Notes")
+SLIP_COLS = ("Date", "SignalTime", "Symbol", "Direction", "Setup",
+             "Trigger", "BestRunPct", "ExpiredAt", "Outcome", "Notes")
 SETUP_NAMES = {"S1": "S1_ORB_BREAKOUT", "S2": "S2_VWAP_PULLBACK",
                "S3": "S3_SUPERTREND_FLIP", "S4": "S4_NR7_EXPANSION"}
 
@@ -941,7 +978,7 @@ def upsert_daily_summary(ds_rows, tj_rows, day):
     ds_rows.sort(key=lambda r: r.get("Date", ""))
 
 
-def journal_status(rows, day, tripped, bnote):
+def journal_status(rows, day, tripped, bnote, pending_n=0, slip_n=0):
     """Short journal block appended to every live-scan report."""
     todays = [r for r in rows if r.get("Date") == str(day)]
     closed = [r for r in todays if r.get("Status") == "CLOSED"]
@@ -949,9 +986,10 @@ def journal_status(rows, day, tripped, bnote):
     wins = sum(1 for r in closed if r.get("Result") == "WIN")
     losses = sum(1 for r in closed if r.get("Result") == "LOSS")
     netr = sum(float(r["PnL_R"]) for r in closed if r.get("PnL_R"))
-    line = (f"Journal today: {len(todays)} signal(s) | open {open_n} | "
+    line = (f"Journal today: {len(todays)} trade(s) | open {open_n} | "
             f"closed {len(closed)} ({wins}W/{losses}L) | "
-            f"day P/L {_fmt_signed(netr, 3)}R")
+            f"day P/L {_fmt_signed(netr, 3)}R | "
+            f"fill gate: {pending_n} pending | slippage {slip_n}")
     if tripped:
         line += " | BREAKER: " + bnote
     return [line]
@@ -975,6 +1013,170 @@ def journal_lines(rows, day, tripped, bnote):
     out.append(f"Day P/L: {_fmt_signed(netr, 3)}R | breaker: "
                + (f"YES ({bnote})" if tripped else "no"))
     return out
+
+
+# ------------------------------------------------------------------
+# Fill-confirmation gate + slippage log, and the auto-tune engine.
+#
+# A fired signal is NOT a trade yet. It first waits in state.json's
+# 'pending' list; on every later sweep check_pending() looks at the
+# stock's completed 5-minute bars SINCE the signal:
+#   LONG : filled iff some bar's Low <= trigger * (1 + FILL_TOL_PCT%)
+#   SHORT: filled iff some bar's High >= trigger * (1 - FILL_TOL_PCT%)
+# i.e. price really came back to the signal price (a limit order at the
+# trigger would have filled). A fill is journaled with the fill bar as
+# SignalTime so grading starts there; Remarks keep the original signal
+# time for audit. A signal that never retraces by FILL_DEADLINE (15:00)
+# is written to journal/slippage_log.csv with how far the price ran
+# away, and never counts as a trade.
+#
+# autotune_buckets() then reads BOTH files over the last 5 sessions and
+# mutes the (strategy, side) buckets that are net-losing or chronically
+# slipping - the scanner's own accuracy trend steers what it fires.
+# ------------------------------------------------------------------
+
+def save_state(st):
+    try:
+        with open(STATE_FILE, "w") as fh:
+            json.dump(st, fh)
+    except OSError:
+        pass
+
+
+def pending_new(sig, day, now):
+    """A fired signal awaiting fill confirmation (state.json 'pending')."""
+    return {"date": str(day), "time": f"{now:%H:%M}", "sig": sig, "best": 0.0}
+
+
+def check_pending(pend, bars, day, now):
+    """The fill-confirmation gate, run on every LIVE/WRAP sweep BEFORE the
+    journal grading. Promotes a pending signal to a journal trade only when
+    price retraces to the trigger price (within FILL_TOL_PCT); runaways
+    that never retrace by FILL_DEADLINE expire to the slippage log.
+    Mutates pend in place; returns (filled_pends, slipped_pends)."""
+    tol = FILL_TOL_PCT / 100.0
+    filled, slipped, keep = [], [], []
+    for p in pend:
+        sig = p["sig"]
+        e = float(sig["entry"])
+        b = bars.get(sig["symbol"] + ".NS")
+        touch = None
+        if b is not None and len(b):
+            try:
+                hh, mm = map(int, p["time"].split(":"))
+            except ValueError:
+                hh, mm = 9, 15
+            w = b[[t.time() >= dt.time(hh, mm) for t in b.index]]
+            if len(w):
+                if sig["target"] > sig["entry"]:            # LONG
+                    p["best"] = max(p.get("best", 0.0),
+                                    100.0 * (float(w["High"].max()) - e) / e)
+                    hit = w[w["Low"] <= e * (1 + tol)]
+                else:                                       # SHORT
+                    p["best"] = max(p.get("best", 0.0),
+                                    100.0 * (e - float(w["Low"].min())) / e)
+                    hit = w[w["High"] >= e * (1 - tol)]
+                if len(hit):
+                    touch = f"{hit.index[0]:%H:%M}"
+        if touch is not None:
+            p["fill_time"] = touch
+            filled.append(p)
+        elif now.time() >= FILL_DEADLINE:
+            p["expired"] = f"{now:%H:%M}"
+            slipped.append(p)
+        else:
+            keep.append(p)
+    pend[:] = keep
+    return filled, slipped
+
+
+def fill_to_row(p, day, now, trade_id):
+    """Journal row for a signal that CONFIRMED by retracing to its trigger.
+    SignalTime becomes the fill bar time, so grading starts at the fill;
+    Remarks narrate both the original signal time and the fill."""
+    sig = p["sig"]
+    row = signal_to_row(sig, day, now, trade_id)
+    ft = p.get("fill_time") or f"{now:%H:%M}"
+    row["SignalTime"] = ft
+    row["UpdatedAt"] = f"{now:%Y-%m-%d %H:%M:%S}"
+    row["Remarks"] = (f"Entry triggered @ {sig['entry']:.2f} at {ft} IST "
+                      f"(signal fired {p['time']}; filled on retrace to trigger)")
+    if sig.get("regime"):
+        row["Remarks"] += f" | {sig['regime']}"
+    return row
+
+
+def slip_to_row(p, day, now):
+    """Slippage-log row: a fired signal that never retraced to its trigger,
+    so it was never really takeable at the signal price."""
+    sig = p["sig"]
+    side = "LONG" if sig["target"] > sig["entry"] else "SHORT"
+    return {"Date": str(day), "SignalTime": p["time"],
+            "Symbol": sig["symbol"], "Direction": side,
+            "Setup": SETUP_NAMES.get(sig["strategy"], sig["strategy"]),
+            "Trigger": f"{sig['entry']:.2f}",
+            "BestRunPct": f"{p.get('best', 0.0):.2f}",
+            "ExpiredAt": p.get("expired", f"{now:%H:%M}"),
+            "Outcome": "SLIPPAGE (never retraced to trigger)",
+            "Notes": sig.get("why", "") +
+                     (f" | {sig['regime']}" if sig.get("regime") else "")}
+
+
+def autotune_buckets(tj_rows, slip_rows, day):
+    """The auto-correct engine. Over the last AT_WINDOW_DAYS trading
+    sessions STRICTLY BEFORE today, grade every (Setup, Direction) bucket
+    from the journal (graded fills) and the slippage log (runaways):
+      * net R below zero with >= AT_MIN_TRADES fills -> MUTED (losing logic)
+      * >= AT_SLIP_MIN runaways and slips > fills    -> MUTED (chronic chase)
+      * anything else, including buckets with no history -> ENABLED
+    Today's own rows are never judged (no intra-day feedback loop). The
+    scanner re-reads the CSVs on every sweep, so the mute list follows the
+    dominant recent trend of its own accuracy automatically.
+    Returns (muted_keys, report_lines)."""
+    today = str(day)
+    dates = {r.get("Date", "") for r in list(tj_rows) + list(slip_rows)}
+    window = sorted(d for d in dates if d and d < today)[-AT_WINDOW_DAYS:]
+    wset = set(window)
+    buckets = {}
+    for r in tj_rows:
+        if r.get("Date") not in wset or r.get("Status") != "CLOSED":
+            continue
+        k = (r.get("Setup", "?"), r.get("Direction", "?"))
+        b = buckets.setdefault(k, {"fills": 0, "wins": 0, "losses": 0,
+                                   "netr": 0.0, "slips": 0})
+        b["fills"] += 1
+        try:
+            b["netr"] += float(r.get("PnL_R") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        if r.get("Result") == "WIN":
+            b["wins"] += 1
+        elif r.get("Result") == "LOSS":
+            b["losses"] += 1
+    for r in slip_rows:
+        if r.get("Date") not in wset:
+            continue
+        k = (r.get("Setup", "?"), r.get("Direction", "?"))
+        b = buckets.setdefault(k, {"fills": 0, "wins": 0, "losses": 0,
+                                   "netr": 0.0, "slips": 0})
+        b["slips"] += 1
+    muted, lines = set(), []
+    for k in sorted(buckets):
+        b = buckets[k]
+        why = ""
+        if b["fills"] >= AT_MIN_TRADES and b["netr"] < -1e-9:
+            why = "losing net R"
+        elif b["slips"] >= AT_SLIP_MIN and b["slips"] > b["fills"]:
+            why = "chronic slippage"
+        if why:
+            muted.add(k)
+        lines.append(f"  {k[0]:<19} {k[1]:<5} fills {b['fills']:>2} "
+                     f"({b['wins']}W/{b['losses']}L) "
+                     f"net {_fmt_signed(b['netr'], 2)}R | slips {b['slips']}"
+                     f"  ->  {'MUTED (' + why + ')' if why else 'enabled'}")
+    if not lines:
+        lines.append("  no history yet - every setup/side enabled by default")
+    return muted, lines
 
 
 # ------------------------------------------------------------------
@@ -1041,15 +1243,41 @@ def main():
                 f["apct"] = atr_pct_daily(d)
                 ctx[s] = f
 
-    # ---- trade journal: load, grade open rows, circuit breaker ----
+    # ---- journal, slippage log, fill gate, circuit breaker, auto-tune ----
     tj_rows = read_csv_rows(TJ_FILE)
     backfill_remarks(tj_rows)          # fill Remarks for pre-upgrade rows
     ds_rows = read_csv_rows(DS_FILE)
+    slip_rows = read_csv_rows(SLIP_FILE)
+    state = load_state(day)
+    pend = state.setdefault("pending", [])
+    filled_p, slip_p = [], []
+    if ph in ("LIVE", "WRAP"):
+        # Fill-confirmation gate BEFORE grading: signals that retraced to
+        # their trigger become journal rows (graded from the fill bar on);
+        # runaways that expired at 15:00 go to the slippage log instead.
+        filled_p, slip_p = check_pending(pend, bars, day, now)
+        for p in filled_p:
+            sig = p["sig"]
+            side = "LONG" if sig["target"] > sig["entry"] else "SHORT"
+            tid = unique_trade_id(tj_rows, day, sig["symbol"], side)
+            tj_rows.append(fill_to_row(p, day, now, tid))
+        for p in slip_p:
+            slip_rows.append(slip_to_row(p, day, now))
+        if filled_p or slip_p:
+            save_state(state)
+        if filled_p:
+            print(f"fill gate: {len(filled_p)} signal(s) confirmed on retrace")
+        if slip_p:
+            print(f"fill gate: {len(slip_p)} signal(s) -> slippage log "
+                  "(never retraced to trigger)")
     graded, stale = monitor_journal(tj_rows, bars, daily, day, now,
                                     intra=intra)
     if graded or stale:
         print(f"journal: graded {graded} row(s) today, closed {stale} stale row(s)")
     tripped, bnote = breaker_state(tj_rows, day)
+
+    # ---- auto-tune: mute strategy/side buckets losing or slipping lately ----
+    muted, tune_lines = autotune_buckets(tj_rows, slip_rows, day)
 
     lines = [f"# NSE F&O Scanner - {day:%d %b %Y} {now:%H:%M} IST (phase {ph})",
              "", f"{nifty_tag}  |  universe scanned: {len(bars)} stocks", ""]
@@ -1092,51 +1320,76 @@ def main():
             lines.append("")
         tripped, bnote = breaker_state(tj_rows, day)
         lines += journal_lines(tj_rows, day, tripped, bnote)
+        today_slips = [r for r in slip_rows if r.get("Date") == str(day)]
+        if today_slips:
+            lines += ["", f"Slippage today: {len(today_slips)} fired signal(s) "
+                          "never retraced to their trigger price - logged in "
+                          "journal/slippage_log.csv, not in the trade journal:"]
+            for r in today_slips[:12]:
+                lines.append(f"  {r['SignalTime']} {r['Symbol']} "
+                             f"{r['Setup'].split('_')[0]} {r['Direction']} "
+                             f"@ {r['Trigger']} (ran {r['BestRunPct']}% away)")
+        if pend:
+            lines += ["", f"Fill gate: {len(pend)} signal(s) still waiting for a "
+                          "retrace to trigger (expires 15:00)."]
         lines += ["", "Square off any open MIS positions now. The broker auto "
                       "square-off follows; never widen a stop."]
     else:
         lines += ["## Strategy signals (live scan)", ""]
-        found = []
+        lines += [f"Auto-tune, last {AT_WINDOW_DAYS} sessions (win/loss + "
+                  "slippage dominance; muted buckets fire nothing):"]
+        lines += tune_lines
+        lines.append("")
+        found, tune_blocked = [], []
         for s, b in bars.items():
             f = ctx.get(s)
             if not f:
                 continue
             v = vwaps[s]
-            for fn, args in ((sig_s1, (b, v, nifty_side, f["apct"])),
-                             (sig_s2, (b, v, f, nifty_side, f["apct"])),
-                             (sig_s3, (b, v, nifty_side, f["apct"])),
-                             (sig_s4, (b, v, f, nifty_side, f["apct"]))):
+            for fn, args in ((sig_s1, (b, v, f["apct"])),
+                             (sig_s2, (b, v, f, f["apct"])),
+                             (sig_s3, (b, v, f["apct"])),
+                             (sig_s4, (b, v, f, f["apct"]))):
                 try:
                     r = fn(s, *args)
                 except Exception:
                     r = None
-                if r:
-                    found.append(r)
-        state = load_state(day)
+                if not r:
+                    continue
+                side = "LONG" if r["target"] > r["entry"] else "SHORT"
+                if (SETUP_NAMES.get(r["strategy"], r["strategy"]),
+                        side) in muted:
+                    tune_blocked.append(f"{r['strategy']} {side} {r['symbol']}")
+                    continue
+                found.append(r)
         new = [r for r in found if r["key"] not in state["fired"]]
         take = new[:MAX_SIGNALS]
         for r in take:
             state["fired"][r["key"]] = f"{now:%H:%M}"
-        with open(STATE_FILE, "w") as fh:
-            json.dump(state, fh)
+            r["regime"] = (f"NIFTY {REG_NAME[nifty_side]} "
+                           f"(score {nifty_score:+d})")
 
-        # Journal newly fired signals unless the circuit breaker is tripped.
-        journaled = 0
+        # New signals enter the fill-confirmation gate: they become journal
+        # rows only if price retraces to the trigger; runaways are logged
+        # as slippage at 15:00. The circuit breaker still forces watch-only.
+        pended = 0
         if tripped:
             lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups are watch-only: "
                       "take nothing new today; manage open positions normally.", ""]
         else:
             for r in take:
                 try:
-                    r["regime"] = (f"NIFTY {REG_NAME[nifty_side]} "
-                                   f"(score {nifty_score:+d})")
-                    side = "LONG" if r["target"] > r["entry"] else "SHORT"
-                    tid = unique_trade_id(tj_rows, day, r["symbol"], side)
-                    tj_rows.append(signal_to_row(r, day, now, tid))
-                    journaled += 1
+                    pend.append(pending_new(r, day, now))
+                    pended += 1
                 except Exception as exc:
-                    print("journal append failed:", exc)
+                    print("fill-gate append failed:", exc)
+        save_state(state)
 
+        if tune_blocked:
+            lines += [f"Auto-tune suppressed {len(tune_blocked)} setup(s) on "
+                      "recent losses/slippage: "
+                      + ", ".join(tune_blocked[:6])
+                      + (" ..." if len(tune_blocked) > 6 else ""), ""]
         if found:
             fresh = {r["key"] for r in take}
             lines += [card(r, r["key"] in fresh) for r in
@@ -1145,10 +1398,17 @@ def main():
             lines.append("No qualifying setups right now.")
         lines += ["", f"Signals detected this run: {len(found)}; "
                       f"new today: {len(new)} (reporting cap {MAX_SIGNALS}/run); "
-                      f"journaled this run: {journaled}."]
-        lines += journal_status(tj_rows, day, tripped, bnote)
+                      f"sent to fill gate: {pended}; confirmed on retrace "
+                      f"this run: {len(filled_p)}; slippage this run: "
+                      f"{len(slip_p)}."]
+        today_slip_n = sum(1 for r in slip_rows if r.get("Date") == str(day))
+        lines += journal_status(tj_rows, day, tripped, bnote,
+                                len(pend), today_slip_n)
         lines += ["", "Execution rules: place a bracket order (entry + SL + 5R target) "
                       "or a market/limit entry plus a separate SL-M order. "
+                      f"A signal is journaled only after price retraces to its "
+                      f"trigger (within {FILL_TOL_PCT:g}%); runaways are logged "
+                      "as slippage and never counted as trades. "
                       "If neither level hits by 14:45, square off by 15:05. "
                       "Never widen a stop. Never take a second entry in the same "
                       "stock on the same strategy today."]
@@ -1156,6 +1416,7 @@ def main():
     upsert_daily_summary(ds_rows, tj_rows, day)
     write_csv_rows(TJ_FILE, TJ_COLS, tj_rows)
     write_csv_rows(DS_FILE, DS_COLS, ds_rows)
+    write_csv_rows(SLIP_FILE, SLIP_COLS, slip_rows)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
     write_report(os.path.join(REPORTS_DIR, f"report_{day:%Y-%m-%d}.md"), lines)
