@@ -1,1 +1,1 @@
-{"date": "2026-10-30", "fired": {}, "regime": "DOWN"}
+{"date": "2026-10-30", "fired": {"BALKRISIND.NS|S4|SHORT": "10:07"}, "regime": "DOWN", "pending": [{"date": "2026-10-30", "time": "10:07", "sig": {"entry": 2078.5, "stop": 2084.74, "target": 2047.32, "qty": 32, "notional": 66512, "risk_rs": 200, "target_rs": 998, "stop_pct": 0.3, "strategy": "S4", "symbol": "BALKRISIND", "why": "NR7 range expansion", "key": "BALKRISIND.NS|S4|SHORT", "regime": "NIFTY DOWN (score -3)"}, "best": 0.0}]}
