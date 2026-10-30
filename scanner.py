@@ -36,22 +36,49 @@ Two self-correcting layers sit on top of the four strategies:
   * Auto-tune engine (trend dominance). Over the last 5 trading
     sessions every (strategy, side) bucket is graded from the journal
     and the slippage log on every sweep: buckets with negative net R
-    (>= 2 graded fills) or chronic slippage (>= 3 runaways) are muted
-    for the rest of the day; winners keep firing. The scanner thus
-    keeps re-aligning itself with the dominant recent trend of its
-    own accuracy.
+    (>= 2 graded fills) or chronic slippage (>= 3 runaways) are muted;
+    winners keep firing. The scanner thus keeps re-aligning itself with
+    the dominant recent trend of its own accuracy. At the 15:05+ sweep
+    an end-of-day learning snapshot (window INCLUDING today) shows
+    exactly what the scanner will apply from the next session.
+
+Daily trade cap and the tracking lab (journal everything):
+
+  * every fired signal carries a Mode. TRADE = actionable, counts
+    toward the daily budget of CAP_TRADES_DAY = 10 trades. TRACKING =
+    journaled and graded exactly like a trade, but explicitly NOT to
+    be taken: it keeps measuring the accuracy of strategies that the
+    auto-tuner muted, that fire on a circuit-breaker day, or that fire
+    after the cap. When the 10th TRADE fills, the scanner sends an
+    immediate Telegram "stop trading for the day" message; signals
+    keep flowing as TRACKING until the 13:30 signal cutoff. The budget
+    counts committed trade slots (fills + signals still awaiting fill
+    confirmation), so a burst cannot overshoot the cap, and a signal
+    that ends up in the slippage log frees its slot.
+
+  * tracking rows feed the auto-tuner like real rows, so a muted
+    strategy can EARN ITS WAY BACK by paper-winning inside the journal
+    - the learning loop never starves.
 
 This script runs inside GitHub Actions every 10 minutes between 08:30
 and 15:45 IST, Monday-Friday. It reads the IST clock itself:
 
   before 09:20        -> exits silently (nothing to do yet)
   09:20 - 09:29 PREP  -> pre-market watchlist (gaps, NR7/inside-day names)
-  09:30 - 14:29 LIVE  -> full strategy scan
-  14:30 - 15:45 WRAP  -> keeps grading open rows; force-closes whatever
-                         is still open at the 15:05+ sweep (auto square-off).
-                         Extended past 15:20 so GitHub cron delays/skips
-                         cannot strand a row overnight.
+  09:30 - 13:29 LIVE  -> full strategy scan; the signal window ends at
+                         13:30 IST - after that no NEW signals fire and
+                         the scanner only grades and manages open rows
+  13:30 - 15:45 WRAP  -> grading only; force-closes whatever is still
+                         open at the 15:05+ sweep (auto square-off) and
+                         prints the EOD learning snapshot. Extended past
+                         15:20 so GitHub cron delays/skips cannot strand
+                         a row overnight.
   weekends / holidays -> exits (no fresh market data)
+
+Any sweep that wakes up more than 25 minutes after the previous one
+prints a "Sweep gap detected" warning in the report and Telegram, so
+GitHub's cron delays and skipped runs are visible instead of silently
+missing signals.
 
 Data source: Yahoo Finance via the free `yfinance` library (no API key).
 Optional test hooks (environment variables):
@@ -85,7 +112,7 @@ RR            = 5.0     # strict reward : risk ratio
 MIN_STOP_PCT  = 0.003   # stop must be >= 0.3% away (cost floor)
 MAX_STOP_PCT  = 0.015   # stop must be <= 1.5% away (5R must stay reachable)
 REACH_FRAC    = 1.00    # 5R target must fit inside ATR(14) daily range
-MAX_SIGNALS   = 3       # max new signals reported per run
+CAP_TRADES_DAY = 10    # daily trade budget: the 10th TRADE fill stops trading
 COST_RS       = 60      # estimated round-trip cost per trade (reporting only)
 MARGIN_MULT   = 5       # SEBI intraday (MIS) leverage ceiling for sizing cap
 
@@ -104,6 +131,9 @@ FILL_DEADLINE = dt.time(15, 0)   # unfilled signals expire to slippage here
 AT_WINDOW_DAYS = 5      # trading sessions of history feeding the tuner
 AT_MIN_TRADES  = 2      # graded fills needed before net R can mute a bucket
 AT_SLIP_MIN    = 3      # runaway signals that mark a bucket as chronic chase
+
+# --- cron health: warn in the report when sweeps were skipped/delayed ---
+SWEEP_GAP_WARN_MIN = 25   # > 2 skipped 10-min slots before the report warns
 
 IST = ZoneInfo("Asia/Kolkata")   # NSE runs on India Standard Time (UTC+5:30)
 
@@ -131,11 +161,35 @@ def phase_of(now):
     t = now.time()
     if dt.time(9, 20) <= t < dt.time(9, 30):
         return "PREP"
-    if dt.time(9, 30) <= t < dt.time(14, 30):
+    if dt.time(9, 30) <= t < dt.time(13, 30):     # signal window ends 13:30
         return "LIVE"
-    if dt.time(14, 30) <= t <= dt.time(15, 45):   # 15:20 -> 15:45: cron-delay
+    if dt.time(13, 30) <= t <= dt.time(15, 45):   # 15:20 -> 15:45: cron-delay
         return "WRAP"                             # safety for the EOD close
     return None
+
+
+def sweep_delay_note(prev_hhmm, now):
+    """Report-line warning when GitHub's scheduler fired late or skipped
+    runs. The scanner self-heals (it reads the IST clock and processes
+    whatever slot it wakes up in), but bars between the missed slots were
+    never scanned - the user should SEE that in the report instead of
+    wondering why a signal is missing. prev and now are always the same
+    day because state.json is day-scoped."""
+    try:
+        hh, mm = map(int, str(prev_hhmm).split(":"))
+    except ValueError:
+        return ""
+    prev = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    gap = (now - prev).total_seconds() / 60.0
+    if gap <= SWEEP_GAP_WARN_MIN:
+        return ""
+    missed = int(gap // 10)
+    return (f"**Sweep gap detected:** previous sweep {prev_hhmm} IST, this "
+            f"one {now:%H:%M} IST - about {missed} x 10-min slot(s) were "
+            "skipped or badly delayed by GitHub's scheduler, so bars in "
+            "between were never scanned. Isolated delays are normal "
+            "(GitHub cron is best-effort); if this appears every day, see "
+            "README > 'Scheduled runs not firing on GitHub'.")
 
 
 # ------------------------------------------------------------------
@@ -608,12 +662,20 @@ def send_telegram(text):
 
 
 def card(s, new):
-    tag = "[NEW] " if new else ""
+    if s.get("mode") == "TRACKING":
+        tag = "[NEW][TRACKING] " if new else "[TRACKING] "
+    elif new:
+        tag = f"[NEW][TRADE {s.get('budget', '?')}] "
+    else:
+        tag = ""
+    tail = ""
+    if s.get("mode") == "TRACKING" and s.get("mode_why"):
+        tail = f" | tracking: {s['mode_why']}"
     return (f"{tag}[{s['strategy']}][{s['key'].split('|')[-1]}] {s['symbol']}  "
             f"@ {s['entry']} | SL {s['stop']} ({s['stop_pct']}%) | "
             f"TGT {s['target']} (5R) | qty {s['qty']} | "
             f"risk Rs {s['risk_rs']} | reward Rs {s['target_rs']}\n"
-            f"     setup: {s['why']}")
+            f"     setup: {s['why']}{tail}")
 
 
 # ------------------------------------------------------------------
@@ -647,12 +709,15 @@ REMARK_EXIT_LABELS = {"STOP_HIT": "STOP HIT", "TARGET_HIT": "TARGET HIT",
 
 TJ_COLS = ("TradeID", "Date", "SignalTime", "Symbol", "Direction", "Setup",
            "Entry", "StopLoss", "Target", "Qty", "RiskPerShare", "RiskAmt",
-           "RewardAmt", "RR", "Status", "ExitPrice", "ExitTime", "ExitReason",
-           "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Remarks", "Notes")
-DS_COLS = ("Date", "Trades", "Wins", "Losses", "Flats", "Open", "WinRatePct",
-           "NetR", "NetPnlAmt", "BreakerTripped", "DayVerdict", "Notes")
+           "RewardAmt", "RR", "Status", "Mode", "ExitPrice", "ExitTime",
+           "ExitReason", "Result", "PnL_R", "PnL_Amt", "UpdatedAt",
+           "Remarks", "Notes")
+DS_COLS = ("Date", "Trades", "Tracking", "Wins", "Losses", "Flats", "Open",
+           "WinRatePct", "NetR", "NetPnlAmt", "BreakerTripped",
+           "DayVerdict", "Notes")
 SLIP_COLS = ("Date", "SignalTime", "Symbol", "Direction", "Setup",
-             "Trigger", "BestRunPct", "ExpiredAt", "Outcome", "Notes")
+             "Trigger", "BestRunPct", "ExpiredAt", "Outcome", "Mode",
+             "Notes")
 SETUP_NAMES = {"S1": "S1_ORB_BREAKOUT", "S2": "S2_VWAP_PULLBACK",
                "S3": "S3_SUPERTREND_FLIP", "S4": "S4_NR7_EXPANSION"}
 
@@ -663,6 +728,15 @@ def read_csv_rows(path):
             return [dict(r) for r in csv.DictReader(f)]
     except (OSError, UnicodeDecodeError):
         return []
+
+
+def normalize_modes(rows):
+    """Journal rows written before the Mode column existed were all real
+    trades - stamp them TRADE so the cap/breaker math stays correct."""
+    for r in rows:
+        if not r.get("Mode"):
+            r["Mode"] = "TRADE"
+    return rows
 
 
 def write_csv_rows(path, cols, rows):
@@ -751,6 +825,7 @@ def signal_to_row(sig, day, now, trade_id):
         "RewardAmt": f"{qty * abs(sig['target'] - sig['entry']):.2f}",
         "RR": RR_LABEL,
         "Status": "OPEN",
+        "Mode": sig.get("mode", "TRADE"),
         "ExitPrice": "", "ExitTime": "", "ExitReason": "",
         "Result": "", "PnL_R": "", "PnL_Amt": "",
         "UpdatedAt": f"{now:%Y-%m-%d %H:%M:%S}",
@@ -927,11 +1002,14 @@ def force_close_eod(rows, bars, daily, day, now):
 
 
 def breaker_state(rows, day):
-    """Circuit breaker computed from CLOSED rows only (naturally sticky:
-    closed rows never change). Triggers: day P/L <= -2R, or 2 consecutive
-    losses. Returns (tripped, note)."""
+    """Circuit breaker computed from CLOSED TRADE rows only (tracking rows
+    are accuracy data, not money, so they never trip the breaker; closed
+    rows never change, so the breaker is naturally sticky). Triggers: day
+    P/L <= -2R, or 2 consecutive losses. Returns (tripped, note)."""
     todays = sorted([r for r in rows
-                     if r.get("Date") == str(day) and r.get("Status") == "CLOSED"],
+                     if r.get("Date") == str(day)
+                     and r.get("Status") == "CLOSED"
+                     and r.get("Mode", "TRADE") == "TRADE"],
                     key=lambda r: r.get("ExitTime") or "")
     realized = sum(float(r["PnL_R"]) for r in todays if r.get("PnL_R"))
     streak = 0
@@ -951,9 +1029,13 @@ def breaker_state(rows, day):
 
 
 def upsert_daily_summary(ds_rows, tj_rows, day):
-    """One evolving row per day in daily_summary.csv."""
+    """One evolving row per day in daily_summary.csv. Trades = TRADE-mode
+    rows only (the real book); TRACKING rows are the accuracy lab and get
+    their own column plus a Notes suffix."""
     todays = [r for r in tj_rows if r.get("Date") == str(day)]
-    closed = [r for r in todays if r.get("Status") == "CLOSED"]
+    trades = [r for r in todays if r.get("Mode", "TRADE") == "TRADE"]
+    tracks = [r for r in todays if r.get("Mode", "TRADE") == "TRACKING"]
+    closed = [r for r in trades if r.get("Status") == "CLOSED"]
     wins = sum(1 for r in closed if r.get("Result") == "WIN")
     losses = sum(1 for r in closed if r.get("Result") == "LOSS")
     flats = sum(1 for r in closed if r.get("Result") == "FLAT")
@@ -961,14 +1043,25 @@ def upsert_daily_summary(ds_rows, tj_rows, day):
     netamt = round(sum(float(r["PnL_Amt"]) for r in closed), 2)
     wr = round(100.0 * wins / len(closed), 1) if closed else 0.0
     tripped, note = breaker_state(tj_rows, day)
-    row = {"Date": str(day), "Trades": len(todays), "Wins": wins,
-           "Losses": losses, "Flats": flats, "Open": len(todays) - len(closed),
+    tclosed = [r for r in tracks if r.get("Status") == "CLOSED"]
+    tw = sum(1 for r in tclosed if r.get("Result") == "WIN")
+    tnet = round(sum(float(r["PnL_R"]) for r in tclosed
+                     if r.get("PnL_R")), 3)
+    notes = note if tripped else ""
+    if tracks:
+        lab = (f"tracking lab {len(tclosed)} graded ({tw}W/"
+               f"{len(tclosed) - tw}L, {_fmt_signed(tnet, 2)}R)")
+        notes = f"{notes}; {lab}" if notes else lab
+    if not todays and not notes:
+        notes = "no qualifying setups today"
+    row = {"Date": str(day), "Trades": len(trades), "Tracking": len(tracks),
+           "Wins": wins, "Losses": losses, "Flats": flats,
+           "Open": len(trades) - len(closed),
            "WinRatePct": f"{wr:.1f}", "NetR": _fmt_signed(netr, 3),
            "NetPnlAmt": _fmt_signed(netamt, 2),
            "BreakerTripped": "YES" if tripped else "NO",
            "DayVerdict": "FAILED" if tripped else "PASSED",
-           "Notes": note if tripped else
-                    ("" if todays else "no qualifying setups today")}
+           "Notes": notes}
     for i, r in enumerate(ds_rows):
         if r.get("Date") == str(day):
             ds_rows[i] = row
@@ -979,38 +1072,55 @@ def upsert_daily_summary(ds_rows, tj_rows, day):
 
 
 def journal_status(rows, day, tripped, bnote, pending_n=0, slip_n=0):
-    """Short journal block appended to every live-scan report."""
+    """Short journal block appended to every live-scan report. The trade
+    budget counts TRADE rows only; tracking rows are shown separately."""
     todays = [r for r in rows if r.get("Date") == str(day)]
-    closed = [r for r in todays if r.get("Status") == "CLOSED"]
-    open_n = len(todays) - len(closed)
+    trades = [r for r in todays if r.get("Mode", "TRADE") == "TRADE"]
+    tracks = [r for r in todays if r.get("Mode", "TRADE") == "TRACKING"]
+    closed = [r for r in trades if r.get("Status") == "CLOSED"]
+    open_n = len(trades) - len(closed)
     wins = sum(1 for r in closed if r.get("Result") == "WIN")
     losses = sum(1 for r in closed if r.get("Result") == "LOSS")
     netr = sum(float(r["PnL_R"]) for r in closed if r.get("PnL_R"))
-    line = (f"Journal today: {len(todays)} trade(s) | open {open_n} | "
+    line = (f"Journal today: {len(trades)}/{CAP_TRADES_DAY} trades | "
+            f"tracking {len(tracks)} | open {open_n} | "
             f"closed {len(closed)} ({wins}W/{losses}L) | "
             f"day P/L {_fmt_signed(netr, 3)}R | "
             f"fill gate: {pending_n} pending | slippage {slip_n}")
+    if trades_taken_today(rows, day) >= CAP_TRADES_DAY:
+        line += " | TRADE CAP: trading stopped for today"
     if tripped:
         line += " | BREAKER: " + bnote
     return [line]
 
 
 def journal_lines(rows, day, tripped, bnote):
-    """Detailed per-trade block for the WRAP report."""
+    """Detailed per-row block for the WRAP report. TRADE rows are the real
+    book; TRACKING rows are the accuracy lab - both graded, only TRADE
+    rows count toward the budget and the breaker."""
     todays = [r for r in rows if r.get("Date") == str(day)]
     if not todays:
         return ["No signals fired today - nothing to journal."]
-    out = [f"Journaled today: {len(todays)} signal(s)."]
+    trades = [r for r in todays if r.get("Mode", "TRADE") == "TRADE"]
+    tracks = [r for r in todays if r.get("Mode", "TRADE") == "TRACKING"]
+    out = [f"Journaled today: {len(trades)} trade(s) + {len(tracks)} "
+           "tracking row(s) (accuracy lab)."]
     for r in todays:
+        mode = r.get("Mode", "TRADE")
         if r.get("Status") == "CLOSED":
-            out.append(f"  {r['TradeID']}: entry {r['Entry']} -> exit "
-                       f"{r['ExitPrice']} | {r['Result']} {r['PnL_R']}R "
+            out.append(f"  {r['TradeID']} [{mode}]: entry {r['Entry']} -> "
+                       f"exit {r['ExitPrice']} | {r['Result']} {r['PnL_R']}R "
                        f"({r['ExitReason']})")
         else:
-            out.append(f"  {r['TradeID']}: entry {r['Entry']} | still OPEN")
-    closed = [r for r in todays if r.get("Status") == "CLOSED"]
+            out.append(f"  {r['TradeID']} [{mode}]: entry {r['Entry']} | "
+                       "still OPEN")
+    closed = [r for r in trades if r.get("Status") == "CLOSED"]
     netr = sum(float(r["PnL_R"]) for r in closed if r.get("PnL_R"))
-    out.append(f"Day P/L: {_fmt_signed(netr, 3)}R | breaker: "
+    tclosed = [r for r in tracks if r.get("Status") == "CLOSED"]
+    tnetr = sum(float(r["PnL_R"]) for r in tclosed if r.get("PnL_R"))
+    out.append(f"Trade P/L: {_fmt_signed(netr, 3)}R "
+               f"({len(closed)}/{CAP_TRADES_DAY} budget used) | tracking "
+               f"net {_fmt_signed(tnetr, 3)}R | breaker: "
                + (f"YES ({bnote})" if tripped else "no"))
     return out
 
@@ -1103,6 +1213,9 @@ def fill_to_row(p, day, now, trade_id):
                       f"(signal fired {p['time']}; filled on retrace to trigger)")
     if sig.get("regime"):
         row["Remarks"] += f" | {sig['regime']}"
+    if row.get("Mode") == "TRACKING":
+        why = sig.get("mode_why") or "not tradeable"
+        row["Remarks"] += f" | TRACKING ({why}) - accuracy data, do not take"
     return row
 
 
@@ -1118,6 +1231,7 @@ def slip_to_row(p, day, now):
             "BestRunPct": f"{p.get('best', 0.0):.2f}",
             "ExpiredAt": p.get("expired", f"{now:%H:%M}"),
             "Outcome": "SLIPPAGE (never retraced to trigger)",
+            "Mode": sig.get("mode", "TRADE"),
             "Notes": sig.get("why", "") +
                      (f" | {sig['regime']}" if sig.get("regime") else "")}
 
@@ -1177,6 +1291,37 @@ def autotune_buckets(tj_rows, slip_rows, day):
     if not lines:
         lines.append("  no history yet - every setup/side enabled by default")
     return muted, lines
+
+
+def trades_taken_today(rows, day):
+    """TRADE-mode journal rows for the day - the real book. Tracking rows
+    and slippage never count toward the daily budget."""
+    return sum(1 for r in rows
+               if r.get("Date") == str(day)
+               and r.get("Mode", "TRADE") == "TRADE")
+
+
+def fire_mode(muted, tripped, committed):
+    """Mode of a newly fired signal. TRADE = actionable and counts against
+    the daily cap. TRACKING = journaled + graded for accuracy but explicitly
+    not to be taken (auto-tune muted bucket / circuit-breaker day / cap
+    exhausted). Tracking rows keep the learning loop fed so a muted strategy
+    can win its way back into circulation."""
+    if muted:
+        return "TRACKING", "auto-tune muted bucket"
+    if tripped:
+        return "TRACKING", "circuit breaker active"
+    if committed >= CAP_TRADES_DAY:
+        return "TRACKING", f"daily cap {CAP_TRADES_DAY}/{CAP_TRADES_DAY}"
+    return "TRADE", ""
+
+
+def next_session(day):
+    """Next weekday after `day` (weekends skipped; NSE holidays ignored)."""
+    d = day + dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d += dt.timedelta(days=1)
+    return d
 
 
 # ------------------------------------------------------------------
@@ -1244,13 +1389,17 @@ def main():
                 ctx[s] = f
 
     # ---- journal, slippage log, fill gate, circuit breaker, auto-tune ----
-    tj_rows = read_csv_rows(TJ_FILE)
+    tj_rows = normalize_modes(read_csv_rows(TJ_FILE))
     backfill_remarks(tj_rows)          # fill Remarks for pre-upgrade rows
     ds_rows = read_csv_rows(DS_FILE)
-    slip_rows = read_csv_rows(SLIP_FILE)
+    slip_rows = normalize_modes(read_csv_rows(SLIP_FILE))
     state = load_state(day)
+    delay_line = sweep_delay_note(state.get("last_sweep", ""), now)
+    state["last_sweep"] = f"{now:%H:%M}"
+    save_state(state)
     pend = state.setdefault("pending", [])
     filled_p, slip_p = [], []
+    cap_line = ""
     if ph in ("LIVE", "WRAP"):
         # Fill-confirmation gate BEFORE grading: signals that retraced to
         # their trigger become journal rows (graded from the fill bar on);
@@ -1270,6 +1419,22 @@ def main():
         if slip_p:
             print(f"fill gate: {len(slip_p)} signal(s) -> slippage log "
                   "(never retraced to trigger)")
+        # ---- daily trade cap: the 10th TRADE fill stops trading ----
+        if trades_taken_today(tj_rows, day) >= CAP_TRADES_DAY:
+            if state.get("cap_notified") != str(day):
+                state["cap_notified"] = str(day)
+                save_state(state)
+                send_telegram(
+                    f"DAILY TRADE CAP REACHED ({CAP_TRADES_DAY}/"
+                    f"{CAP_TRADES_DAY} trades on {day:%d-%b-%Y}).\n"
+                    "STOP TRADING for the rest of the day - protect the "
+                    "book; manage open positions normally.\n"
+                    "Signals keep firing as TRACKING only until the 13:30 "
+                    "IST cutoff to track accuracy - they are journaled but "
+                    "must NOT be taken.")
+                cap_line = (f"DAILY TRADE CAP REACHED ({CAP_TRADES_DAY}/"
+                            f"{CAP_TRADES_DAY} trades) - stop-trading message "
+                            "sent. TRACKING rows continue for accuracy only.")
     graded, stale = monitor_journal(tj_rows, bars, daily, day, now,
                                     intra=intra)
     if graded or stale:
@@ -1281,6 +1446,8 @@ def main():
 
     lines = [f"# NSE F&O Scanner - {day:%d %b %Y} {now:%H:%M} IST (phase {ph})",
              "", f"{nifty_tag}  |  universe scanned: {len(bars)} stocks", ""]
+    if delay_line:
+        lines += [delay_line, ""]
 
     if ph == "PREP":
         lines += ["## Pre-market watchlist (PREP phase)", ""]
@@ -1332,12 +1499,39 @@ def main():
         if pend:
             lines += ["", f"Fill gate: {len(pend)} signal(s) still waiting for a "
                           "retrace to trigger (expires 15:00)."]
+        if now.time() >= SQUAREOFF_GATE:
+            # ---- end-of-day learning: what tomorrow's sweeps will apply ----
+            # Window INCLUDES today: this is exactly the table the next
+            # session's first LIVE sweep will act on.
+            nxt = next_session(day)
+            _, eod_lines = autotune_buckets(tj_rows, slip_rows, nxt)
+            tr_today = [r for r in tj_rows if r.get("Date") == str(day)
+                        and r.get("Mode", "TRADE") == "TRADE"
+                        and r.get("Status") == "CLOSED"]
+            tk_today = [r for r in tj_rows if r.get("Date") == str(day)
+                        and r.get("Mode", "TRADE") == "TRACKING"
+                        and r.get("Status") == "CLOSED"]
+            twn = sum(1 for r in tr_today if r.get("Result") == "WIN")
+            kwn = sum(1 for r in tk_today if r.get("Result") == "WIN")
+            slip_today_n = sum(1 for r in slip_rows
+                               if r.get("Date") == str(day))
+            lines += ["", f"## EOD learning - applied from the next session "
+                          f"({nxt:%d %b})", ""]
+            lines.append(f"Learned from the last {AT_WINDOW_DAYS} sessions "
+                         f"including today: {len(tr_today)} graded trades "
+                         f"({twn}W/{len(tr_today) - twn}L) + {len(tk_today)} "
+                         f"tracking rows ({kwn}W/{len(tk_today) - kwn}L) + "
+                         f"{slip_today_n} slippage rows. Winning buckets keep "
+                         "firing; muted buckets fire TRACKING-only (journaled "
+                         "for accuracy, not traded) until their results "
+                         "recover:")
+            lines += eod_lines
         lines += ["", "Square off any open MIS positions now. The broker auto "
                       "square-off follows; never widen a stop."]
     else:
         lines += ["## Strategy signals (live scan)", ""]
         lines += [f"Auto-tune, last {AT_WINDOW_DAYS} sessions (win/loss + "
-                  "slippage dominance; muted buckets fire nothing):"]
+                  "slippage dominance; muted buckets fire TRACKING-only):"]
         lines += tune_lines
         lines.append("")
         found, tune_blocked = [], []
@@ -1359,48 +1553,65 @@ def main():
                 side = "LONG" if r["target"] > r["entry"] else "SHORT"
                 if (SETUP_NAMES.get(r["strategy"], r["strategy"]),
                         side) in muted:
+                    # muted bucket: the signal still fires, but as a
+                    # TRACKING row - journaled for accuracy so it can win
+                    # its way back into the live book
+                    r["mode"] = "TRACKING"
+                    r["mode_why"] = "auto-tune muted bucket"
                     tune_blocked.append(f"{r['strategy']} {side} {r['symbol']}")
-                    continue
                 found.append(r)
         new = [r for r in found if r["key"] not in state["fired"]]
-        take = new[:MAX_SIGNALS]
-        for r in take:
+        # daily budget = committed trade slots: TRADE rows already journaled
+        # today + TRADE signals still awaiting fill confirmation (a signal
+        # that ends up as slippage frees its slot on the next sweep)
+        committed = (trades_taken_today(tj_rows, day)
+                     + sum(1 for p in pend
+                           if p.get("sig", {}).get("mode", "TRADE") == "TRADE"))
+        for r in new:
             state["fired"][r["key"]] = f"{now:%H:%M}"
             r["regime"] = (f"NIFTY {REG_NAME[nifty_side]} "
                            f"(score {nifty_score:+d})")
+            if r.get("mode") != "TRACKING":
+                r["mode"], r["mode_why"] = fire_mode(False, tripped, committed)
+            if r["mode"] == "TRADE":
+                committed += 1
+                r["budget"] = f"{committed}/{CAP_TRADES_DAY}"
+            else:
+                r["budget"] = f"{trades_taken_today(tj_rows, day)}/{CAP_TRADES_DAY}"
 
-        # New signals enter the fill-confirmation gate: they become journal
-        # rows only if price retraces to the trigger; runaways are logged
-        # as slippage at 15:00. The circuit breaker still forces watch-only.
+        # EVERY fired signal enters the fill-confirmation gate, whatever its
+        # mode: TRADE rows become trades on a retrace; TRACKING rows become
+        # accuracy rows on a retrace; runaways go to the slippage log.
         pended = 0
         if tripped:
-            lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups are watch-only: "
-                      "take nothing new today; manage open positions normally.", ""]
-        else:
-            for r in take:
-                try:
-                    pend.append(pending_new(r, day, now))
-                    pended += 1
-                except Exception as exc:
-                    print("fill-gate append failed:", exc)
+            lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups fire as "
+                      "TRACKING only - journaled for accuracy; take nothing "
+                      "new today; manage open positions normally.", ""]
+        for r in new:
+            try:
+                pend.append(pending_new(r, day, now))
+                pended += 1
+            except Exception as exc:
+                print("fill-gate append failed:", exc)
         save_state(state)
 
         if tune_blocked:
-            lines += [f"Auto-tune suppressed {len(tune_blocked)} setup(s) on "
-                      "recent losses/slippage: "
+            lines += [f"Auto-tune demoted {len(tune_blocked)} setup(s) to "
+                      "TRACKING on recent losses/slippage: "
                       + ", ".join(tune_blocked[:6])
                       + (" ..." if len(tune_blocked) > 6 else ""), ""]
         if found:
-            fresh = {r["key"] for r in take}
+            fresh = {r["key"] for r in new}
             lines += [card(r, r["key"] in fresh) for r in
                       sorted(found, key=lambda r: r["key"])]
         else:
             lines.append("No qualifying setups right now.")
+        tr_new = sum(1 for r in new if r.get("mode") == "TRADE")
         lines += ["", f"Signals detected this run: {len(found)}; "
-                      f"new today: {len(new)} (reporting cap {MAX_SIGNALS}/run); "
-                      f"sent to fill gate: {pended}; confirmed on retrace "
-                      f"this run: {len(filled_p)}; slippage this run: "
-                      f"{len(slip_p)}."]
+                      f"new today: {len(new)} ({tr_new} TRADE / "
+                      f"{len(new) - tr_new} TRACKING); all sent to the "
+                      f"fill gate; confirmed on retrace this run: "
+                      f"{len(filled_p)}; slippage this run: {len(slip_p)}."]
         today_slip_n = sum(1 for r in slip_rows if r.get("Date") == str(day))
         lines += journal_status(tj_rows, day, tripped, bnote,
                                 len(pend), today_slip_n)
@@ -1409,9 +1620,17 @@ def main():
                       f"A signal is journaled only after price retraces to its "
                       f"trigger (within {FILL_TOL_PCT:g}%); runaways are logged "
                       "as slippage and never counted as trades. "
-                      "If neither level hits by 14:45, square off by 15:05. "
-                      "Never widen a stop. Never take a second entry in the same "
-                      "stock on the same strategy today."]
+                      f"TRADE rows count toward the daily budget of "
+                      f"{CAP_TRADES_DAY}; the {CAP_TRADES_DAY}th TRADE sends "
+                      "the stop-trading alert. TRACKING rows (cap / breaker / "
+                      "muted) are accuracy data - do not take them. New "
+                      "signals stop at 13:30 IST. If neither level hits by "
+                      "14:45, square off by 15:05. Never widen a stop. Never "
+                      "take a second entry in the same stock on the same "
+                      "strategy today."]
+
+    if cap_line:
+        lines += ["", cap_line]
 
     upsert_daily_summary(ds_rows, tj_rows, day)
     write_csv_rows(TJ_FILE, TJ_COLS, tj_rows)
