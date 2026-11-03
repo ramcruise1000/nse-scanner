@@ -5,4 +5,4 @@ Date,Trades,Tracking,Wins,Losses,Flats,Open,WinRatePct,NetR,NetPnlAmt,BreakerTri
 2026-10-29,10,,7,3,0,0,70.0,+23.854,+4727.28,NO,PASSED,
 2026-10-30,4,12,0,4,0,0,0.0,-4.000,-768.64,YES,FAILED,"circuit breaker: day limit -2R / 4-loss streak; tracking lab 6 graded (0W/6L, -6.00R)"
 2026-11-02,5,1,1,4,0,0,20.0,+1.004,+222.80,NO,PASSED,"tracking lab 1 graded (1W/0L, +1.90R)"
-2026-11-03,3,0,0,2,0,1,0.0,-2.000,-393.98,YES,FAILED,circuit breaker: 2-loss streak
+2026-11-03,3,4,1,2,0,0,33.3,+1.907,+378.82,NO,PASSED,"tracking lab 4 graded (1W/3L, -0.48R)"
