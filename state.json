@@ -1,1 +1,1 @@
-{"date": "2026-11-06", "fired": {}, "regime": "UP", "last_sweep": "15:32"}
+{"date": "2026-11-09", "fired": {"CAMS.NS|S4|LONG": "10:27"}, "regime": "DOWN", "last_sweep": "10:27", "pending": [{"date": "2026-11-09", "time": "10:27", "sig": {"entry": 724.6, "stop": 720.65, "target": 744.35, "qty": 50, "notional": 36230, "risk_rs": 197, "target_rs": 987, "stop_pct": 0.55, "strategy": "S4", "symbol": "CAMS", "why": "NR7 range expansion", "key": "CAMS.NS|S4|LONG", "regime": "NIFTY DOWN (score -3)", "mode": "TRADE", "mode_why": "", "budget": "1/10"}, "best": 0.0}]}
