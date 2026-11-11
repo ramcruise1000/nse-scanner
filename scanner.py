@@ -33,32 +33,37 @@ Two self-correcting layers sit on top of the four strategies:
     comes back are logged in journal/slippage_log.csv instead and
     never pollute the win/loss statistics.
 
-  * Auto-tune engine (trend dominance). Over the last 5 trading
-    sessions every (strategy, side) bucket is graded from the journal
-    and the slippage log on every sweep: buckets with negative net R
-    (>= 2 graded fills) or chronic slippage (>= 3 runaways) are muted;
-    winners keep firing. The scanner thus keeps re-aligning itself with
-    the dominant recent trend of its own accuracy. At the 15:05+ sweep
-    an end-of-day learning snapshot (window INCLUDING today) shows
-    exactly what the scanner will apply from the next session.
+  * Auto-tune learner (ADVISORY ONLY - it never blocks a signal). Over
+    the last 5 trading sessions every (strategy, side) bucket is
+    graded from the journal and the slippage log on every sweep, and
+    the report FLAGS buckets that are net-losing (>= 2 graded fills)
+    or chronically slipping (>= 3 runaways). Nothing is ever benched:
+    every qualifying setup keeps firing all day so the accuracy of all
+    four strategies keeps being measured in every market trend. The
+    learner exists to show what is working so the next day improves.
+    At the 15:05+ sweep an end-of-day learning snapshot (window
+    INCLUDING today) shows the full grading table for the next session.
 
-Daily trade cap and the tracking lab (journal everything):
+Daily trade cap and the self-study tail (journal everything):
 
-  * every fired signal carries a Mode. TRADE = actionable, counts
-    toward the daily budget of CAP_TRADES_DAY = 10 trades. TRACKING =
-    journaled and graded exactly like a trade, but explicitly NOT to
-    be taken: it keeps measuring the accuracy of strategies that the
-    auto-tuner muted, that fire on a circuit-breaker day, or that fire
-    after the cap. When the 10th TRADE fills, the scanner sends an
-    immediate Telegram "stop trading for the day" message; signals
-    keep flowing as TRACKING until the 13:30 signal cutoff. The budget
-    counts committed trade slots (fills + signals still awaiting fill
-    confirmation), so a burst cannot overshoot the cap, and a signal
-    that ends up in the slippage log frees its slot.
+  * every qualifying signal fires as TRADE (actionable) and counts
+    toward the daily budget of CAP_TRADES_DAY = 10 trades. When the
+    10th TRADE fill is confirmed, the scanner sends an immediate
+    Telegram "stop trading for the day" message and then STOPS
+    PROVIDING signals: further qualifying setups are still detected
+    and pushed through the fill gate until the 13:30 signal cutoff,
+    but they are only recorded in the journal (Mode=TRACKING, self-
+    study) or the slippage log - they are NOT printed as signal cards
+    and NOT alerted any more. The budget counts committed trade slots
+    (fills + signals still awaiting fill confirmation), so a burst
+    cannot overshoot the cap, and a signal that ends up in the
+    slippage log frees its slot.
 
-  * tracking rows feed the auto-tuner like real rows, so a muted
-    strategy can EARN ITS WAY BACK by paper-winning inside the journal
-    - the learning loop never starves.
+  * self-study rows feed the learner like real rows, so every strategy
+    keeps being measured even after the cap - the learning loop never
+    starves. SIGNAL_BLOCKING = False is the master switch: set it True
+    to restore the legacy behaviour (muted buckets / breaker days fire
+    TRACKING-only).
 
 This script runs inside GitHub Actions every 10 minutes between 08:30
 and 15:45 IST, Monday-Friday. It reads the IST clock itself:
@@ -128,9 +133,18 @@ FILL_TOL_PCT  = 0.10    # signal must retrace to within 0.10% of trigger
 FILL_DEADLINE = dt.time(15, 0)   # unfilled signals expire to slippage here
 
 # --- auto-tune engine (last-N-session win/loss dominance) ---
-AT_WINDOW_DAYS = 5      # trading sessions of history feeding the tuner
-AT_MIN_TRADES  = 2      # graded fills needed before net R can mute a bucket
+AT_WINDOW_DAYS = 5      # trading sessions of history feeding the learner
+AT_MIN_TRADES  = 2      # graded fills needed before net R can flag a bucket
 AT_SLIP_MIN    = 3      # runaway signals that mark a bucket as chronic chase
+
+# --- master switch: can the scanner ever bench (block) a signal? ---
+SIGNAL_BLOCKING = False  # False = NEVER block: the auto-tune learner and
+                         # the circuit breaker are advisory-only (they
+                         # report, they never demote); the only limiter is
+                         # the daily cap, and after it signals are still
+                         # journaled for self-study but not alerted.
+                         # True = legacy: muted buckets / breaker days fire
+                         # TRACKING-only.
 
 # --- cron health: warn in the report when sweeps were skipped/delayed ---
 SWEEP_GAP_WARN_MIN = 25   # > 2 skipped 10-min slots before the report warns
@@ -1141,8 +1155,10 @@ def journal_lines(rows, day, tripped, bnote):
 # away, and never counts as a trade.
 #
 # autotune_buckets() then reads BOTH files over the last 5 sessions and
-# mutes the (strategy, side) buckets that are net-losing or chronically
-# slipping - the scanner's own accuracy trend steers what it fires.
+# grades every (strategy, side) bucket. ADVISORY ONLY (SIGNAL_BLOCKING =
+# False): net-losing or chronically slipping buckets are FLAGGED in the
+# report so you can review them - no signal is ever blocked by the
+# learner, so every strategy keeps being measured in every trend.
 # ------------------------------------------------------------------
 
 def save_state(st):
@@ -1237,16 +1253,19 @@ def slip_to_row(p, day, now):
 
 
 def autotune_buckets(tj_rows, slip_rows, day):
-    """The auto-correct engine. Over the last AT_WINDOW_DAYS trading
+    """The auto-correct learner. Over the last AT_WINDOW_DAYS trading
     sessions STRICTLY BEFORE today, grade every (Setup, Direction) bucket
     from the journal (graded fills) and the slippage log (runaways):
-      * net R below zero with >= AT_MIN_TRADES fills -> MUTED (losing logic)
-      * >= AT_SLIP_MIN runaways and slips > fills    -> MUTED (chronic chase)
+      * net R below zero with >= AT_MIN_TRADES fills -> FLAGGED (losing)
+      * >= AT_SLIP_MIN runaways and slips > fills    -> FLAGGED (chronic chase)
       * anything else, including buckets with no history -> ENABLED
     Today's own rows are never judged (no intra-day feedback loop). The
-    scanner re-reads the CSVs on every sweep, so the mute list follows the
-    dominant recent trend of its own accuracy automatically.
-    Returns (muted_keys, report_lines)."""
+    scanner re-reads the CSVs on every sweep, so the grading always
+    follows the recent trend of its own accuracy. ADVISORY ONLY: the
+    flags steer nothing - every qualifying signal still fires; the
+    report simply shows what has been winning and what has been failing
+    so the next day's plan improves.
+    Returns (flagged_keys, report_lines)."""
     today = str(day)
     dates = {r.get("Date", "") for r in list(tj_rows) + list(slip_rows)}
     window = sorted(d for d in dates if d and d < today)[-AT_WINDOW_DAYS:]
@@ -1287,7 +1306,7 @@ def autotune_buckets(tj_rows, slip_rows, day):
         lines.append(f"  {k[0]:<19} {k[1]:<5} fills {b['fills']:>2} "
                      f"({b['wins']}W/{b['losses']}L) "
                      f"net {_fmt_signed(b['netr'], 2)}R | slips {b['slips']}"
-                     f"  ->  {'MUTED (' + why + ')' if why else 'enabled'}")
+                     f"  ->  {'FLAGGED (' + why + ') - advisory only' if why else 'enabled'}")
     if not lines:
         lines.append("  no history yet - every setup/side enabled by default")
     return muted, lines
@@ -1302,11 +1321,19 @@ def trades_taken_today(rows, day):
 
 
 def fire_mode(muted, tripped, committed):
-    """Mode of a newly fired signal. TRADE = actionable and counts against
-    the daily cap. TRACKING = journaled + graded for accuracy but explicitly
-    not to be taken (auto-tune muted bucket / circuit-breaker day / cap
-    exhausted). Tracking rows keep the learning loop fed so a muted strategy
-    can win its way back into circulation."""
+    """Mode of a newly fired signal. TRADE = actionable, counts against
+    the daily cap and is provided to the user. TRACKING = journaled +
+    graded for self-study but NOT provided (only the exhausted daily
+    cap causes this today). With SIGNAL_BLOCKING = False (current
+    default) nothing else benches a signal: the flagged set and the
+    circuit breaker are advisory-only. Set SIGNAL_BLOCKING = True to
+    restore the legacy behaviour where muted buckets and breaker days
+    fire TRACKING-only."""
+    if not SIGNAL_BLOCKING:
+        if committed >= CAP_TRADES_DAY:
+            return "TRACKING", (f"daily cap {CAP_TRADES_DAY}/"
+                                f"{CAP_TRADES_DAY} - self-study")
+        return "TRADE", ""
     if muted:
         return "TRACKING", "auto-tune muted bucket"
     if tripped:
@@ -1429,19 +1456,21 @@ def main():
                     f"{CAP_TRADES_DAY} trades on {day:%d-%b-%Y}).\n"
                     "STOP TRADING for the rest of the day - protect the "
                     "book; manage open positions normally.\n"
-                    "Signals keep firing as TRACKING only until the 13:30 "
-                    "IST cutoff to track accuracy - they are journaled but "
-                    "must NOT be taken.")
+                    "The scanner stops providing signals now: until the "
+                    "13:30 IST cutoff it still detects setups and records "
+                    "them in the journal for self-study, but it will not "
+                    "alert them any more.")
                 cap_line = (f"DAILY TRADE CAP REACHED ({CAP_TRADES_DAY}/"
                             f"{CAP_TRADES_DAY} trades) - stop-trading message "
-                            "sent. TRACKING rows continue for accuracy only.")
+                            "sent. Further signals are journaled for "
+                            "self-study only (not alerted).")
     graded, stale = monitor_journal(tj_rows, bars, daily, day, now,
                                     intra=intra)
     if graded or stale:
         print(f"journal: graded {graded} row(s) today, closed {stale} stale row(s)")
     tripped, bnote = breaker_state(tj_rows, day)
 
-    # ---- auto-tune: mute strategy/side buckets losing or slipping lately ----
+    # ---- auto-tune learner: grades buckets, ADVISORY ONLY (never blocks) ----
     muted, tune_lines = autotune_buckets(tj_rows, slip_rows, day)
 
     lines = [f"# NSE F&O Scanner - {day:%d %b %Y} {now:%H:%M} IST (phase {ph})",
@@ -1515,26 +1544,27 @@ def main():
             kwn = sum(1 for r in tk_today if r.get("Result") == "WIN")
             slip_today_n = sum(1 for r in slip_rows
                                if r.get("Date") == str(day))
-            lines += ["", f"## EOD learning - applied from the next session "
-                          f"({nxt:%d %b})", ""]
+            lines += ["", f"## EOD learning - grading carried into the next "
+                          f"session ({nxt:%d %b})", ""]
             lines.append(f"Learned from the last {AT_WINDOW_DAYS} sessions "
                          f"including today: {len(tr_today)} graded trades "
                          f"({twn}W/{len(tr_today) - twn}L) + {len(tk_today)} "
                          f"tracking rows ({kwn}W/{len(tk_today) - kwn}L) + "
-                         f"{slip_today_n} slippage rows. Winning buckets keep "
-                         "firing; muted buckets fire TRACKING-only (journaled "
-                         "for accuracy, not traded) until their results "
-                         "recover:")
+                         f"{slip_today_n} slippage rows. Advisory only - "
+                         "flagged buckets are shown so you can review what "
+                         "failed; nothing is blocked and tomorrow every "
+                         "qualifying signal fires again:")
             lines += eod_lines
         lines += ["", "Square off any open MIS positions now. The broker auto "
                       "square-off follows; never widen a stop."]
     else:
         lines += ["## Strategy signals (live scan)", ""]
-        lines += [f"Auto-tune, last {AT_WINDOW_DAYS} sessions (win/loss + "
-                  "slippage dominance; muted buckets fire TRACKING-only):"]
+        lines += [f"Auto-tune learner, last {AT_WINDOW_DAYS} sessions "
+                  "(win/loss + slippage grading - ADVISORY ONLY: nothing "
+                  "is blocked, every qualifying signal fires):"]
         lines += tune_lines
         lines.append("")
-        found, tune_blocked = [], []
+        found = []
         for s, b in bars.items():
             f = ctx.get(s)
             if not f:
@@ -1550,15 +1580,6 @@ def main():
                     r = None
                 if not r:
                     continue
-                side = "LONG" if r["target"] > r["entry"] else "SHORT"
-                if (SETUP_NAMES.get(r["strategy"], r["strategy"]),
-                        side) in muted:
-                    # muted bucket: the signal still fires, but as a
-                    # TRACKING row - journaled for accuracy so it can win
-                    # its way back into the live book
-                    r["mode"] = "TRACKING"
-                    r["mode_why"] = "auto-tune muted bucket"
-                    tune_blocked.append(f"{r['strategy']} {side} {r['symbol']}")
                 found.append(r)
         new = [r for r in found if r["key"] not in state["fired"]]
         # daily budget = committed trade slots: TRADE rows already journaled
@@ -1567,26 +1588,38 @@ def main():
         committed = (trades_taken_today(tj_rows, day)
                      + sum(1 for p in pend
                            if p.get("sig", {}).get("mode", "TRADE") == "TRADE"))
+        # NOTHING is benched: every qualifying signal fires. Before the cap
+        # it is TRADE (provided); after the cap it becomes a self-study row
+        # (withheld): still detected, still fill-gated and journaled, but
+        # not printed as a card and not alerted.
+        provided, withheld = [], []
         for r in new:
             state["fired"][r["key"]] = f"{now:%H:%M}"
             r["regime"] = (f"NIFTY {REG_NAME[nifty_side]} "
                            f"(score {nifty_score:+d})")
-            if r.get("mode") != "TRACKING":
-                r["mode"], r["mode_why"] = fire_mode(False, tripped, committed)
+            r["mode"], r["mode_why"] = fire_mode(muted, tripped, committed)
             if r["mode"] == "TRADE":
                 committed += 1
                 r["budget"] = f"{committed}/{CAP_TRADES_DAY}"
+                provided.append(r)
             else:
                 r["budget"] = f"{trades_taken_today(tj_rows, day)}/{CAP_TRADES_DAY}"
+                withheld.append(r)
 
         # EVERY fired signal enters the fill-confirmation gate, whatever its
         # mode: TRADE rows become trades on a retrace; TRACKING rows become
         # accuracy rows on a retrace; runaways go to the slippage log.
         pended = 0
         if tripped:
-            lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups fire as "
-                      "TRACKING only - journaled for accuracy; take nothing "
-                      "new today; manage open positions normally.", ""]
+            if SIGNAL_BLOCKING:
+                lines += [f"CIRCUIT BREAKER ACTIVE ({bnote}). New setups fire "
+                          "as TRACKING only - journaled for accuracy; take "
+                          "nothing new today; manage open positions "
+                          "normally.", ""]
+            else:
+                lines += [f"Circuit breaker advisory ({bnote}): the day is "
+                          "bleeding - consider standing down, but nothing is "
+                          "blocked and signals keep firing until the cap.", ""]
         for r in new:
             try:
                 pend.append(pending_new(r, day, now))
@@ -1595,22 +1628,23 @@ def main():
                 print("fill-gate append failed:", exc)
         save_state(state)
 
-        if tune_blocked:
-            lines += [f"Auto-tune demoted {len(tune_blocked)} setup(s) to "
-                      "TRACKING on recent losses/slippage: "
-                      + ", ".join(tune_blocked[:6])
-                      + (" ..." if len(tune_blocked) > 6 else ""), ""]
-        if found:
-            fresh = {r["key"] for r in new}
+        if provided:
+            fresh = {r["key"] for r in provided}
             lines += [card(r, r["key"] in fresh) for r in
-                      sorted(found, key=lambda r: r["key"])]
-        else:
+                      sorted(provided, key=lambda r: r["key"])]
+        elif not withheld:
             lines.append("No qualifying setups right now.")
-        tr_new = sum(1 for r in new if r.get("mode") == "TRADE")
+        if withheld:
+            lines += [f"Daily cap reached - {len(withheld)} further signal(s) "
+                      "detected this sweep are recorded for self-study via "
+                      "the fill gate (journal on a retrace, slippage log if "
+                      "price runs away) but are NOT alerted and NOT shown "
+                      "here.", ""]
+        tr_new = len(provided)
         lines += ["", f"Signals detected this run: {len(found)}; "
-                      f"new today: {len(new)} ({tr_new} TRADE / "
-                      f"{len(new) - tr_new} TRACKING); all sent to the "
-                      f"fill gate; confirmed on retrace this run: "
+                      f"new today: {len(new)} ({tr_new} TRADE provided / "
+                      f"{len(withheld)} self-study not alerted); all sent to "
+                      f"the fill gate; confirmed on retrace this run: "
                       f"{len(filled_p)}; slippage this run: {len(slip_p)}."]
         today_slip_n = sum(1 for r in slip_rows if r.get("Date") == str(day))
         lines += journal_status(tj_rows, day, tripped, bnote,
@@ -1619,15 +1653,16 @@ def main():
                       "or a market/limit entry plus a separate SL-M order. "
                       f"A signal is journaled only after price retraces to its "
                       f"trigger (within {FILL_TOL_PCT:g}%); runaways are logged "
-                      "as slippage and never counted as trades. "
-                      f"TRADE rows count toward the daily budget of "
-                      f"{CAP_TRADES_DAY}; the {CAP_TRADES_DAY}th TRADE sends "
-                      "the stop-trading alert. TRACKING rows (cap / breaker / "
-                      "muted) are accuracy data - do not take them. New "
-                      "signals stop at 13:30 IST. If neither level hits by "
-                      "14:45, square off by 15:05. Never widen a stop. Never "
-                      "take a second entry in the same stock on the same "
-                      "strategy today."]
+                      "as slippage and never counted as trades. Nothing is "
+                      "blocked today: every qualifying signal fires as TRADE "
+                      f"until the daily budget of {CAP_TRADES_DAY} is used; "
+                      "the 10th TRADE sends the stop-trading alert and after "
+                      "it further signals are journaled for self-study but "
+                      "not alerted. Self-study (TRACKING) rows are accuracy "
+                      "data - do not take them. New signals stop at 13:30 "
+                      "IST. If neither level hits by 14:45, square off by "
+                      "15:05. Never widen a stop. Never take a second entry "
+                      "in the same stock on the same strategy today."]
 
     if cap_line:
         lines += ["", cap_line]
