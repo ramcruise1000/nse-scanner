@@ -1,0 +1,7 @@
+1:  # Vol5 Extended-Hours Scanner dependencies
+   2:  # GitHub Actions installs these automatically on every run.
+   3:  pandas>=2.0.0
+   4:  numpy>=1.24.0
+   5:  yfinance>=0.2.28
+   6:  requests>=2.31.0
+   7:  python-telegram-bot>=20.7
