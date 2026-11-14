@@ -1,0 +1,78 @@
+1:  # Vol5 — Extended-Hours Dual-Frame 1:5 RR Scanner
+   2:  # Standalone companion to Vol4 (market-sweep.yml). ISOLATED: runs in its own concurrency
+   3:  # group so it never blocks or collides with the existing Vol4 scan.
+   4:  #
+   5:  # Schedule (GitHub cron is ALWAYS UTC; converted below to IST):
+   6:  #   09:30-14:30 IST  ->  04:00-09:00 UTC   (signal generation window)
+   7:  #   15:10, 15:20 IST ->  09:40, 09:50 UTC   (journal finalize passes)
+   8:  #   15:35, 15:45 IST ->  10:05, 10:15 UTC   (finalize safety nets)
+   9:  #
+  10:  # Edit settings in scanner_v5.py (capital/risk, window size, strategies); no
+  11:  # changes to this file are normally needed. If you only see runs when you click
+  12:  # Run workflow yourself, see SOP Section "Scheduled runs not firing" (Section 11).
+  13:  
+  14:  name: Vol5 Extended-Hour Scanner
+  15:  
+  16:  on:
+  17:    schedule:
+  18:      - cron: "*/10 4-9 * * 1-5"
+  19:      - cron: "40,50 9 * * 1-5"
+  20:      - cron: "5,15 10 * * 1-5"
+  21:    workflow_dispatch:
+  22:      inputs:
+  23:        run_mode:
+  24:          description: 'Mode: live (writes to repo) or test (ephemeral staging)'
+  25:          required: false
+  26:          default: 'live'
+  27:        force_time:
+  28:          description: 'SCANNER_FORCE_TIME HH:MM override for dry-run stepping'
+  29:          required: false
+  30:          default: ''
+  31:        test_limit:
+  32:          description: 'SCANNER_TEST_LIMIT N symbols for debug (leave empty in production)'
+  33:          required: false
+  34:          default: ''
+  35:  
+  36:  concurrency:
+  37:    group: vol5-extended
+  38:    cancel-in-progress: false
+  39:  
+  40:  env:
+  41:    PIP_DISABLE_PIP_VERSION_CHECK: 1
+  42:    GIT_AUTHOR_NAME: vol5-bot
+  43:    GIT_AUTHOR_EMAIL: vol5@bot.local
+  44:    GIT_COMMITTER_NAME: vol5-bot
+  45:    GIT_COMMITTER_EMAIL: vol5@bot.local
+  46:  
+  47:  jobs:
+  48:    vol5-scan:
+  49:      runs-on: ubuntu-latest
+  50:      steps:
+  51:        - uses: actions/checkout@v4
+  52:  
+  53:        - name: Set up Python 3.12
+  54:          uses: actions/setup-python@v5
+  55:          with:
+  56:            python-version: '3.12'
+  57:  
+  58:        - name: Install dependencies
+  59:          run: pip install -r requirements.txt
+  60:  
+  61:        - name: Run Vol5 scanner
+  62:          env:
+  63:            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  64:            TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  65:            RUN_MODE: ${{ github.event.inputs.run_mode || 'live' }}
+  66:            SCANNER_FORCE_TIME: ${{ github.event.inputs.force_time }}
+  67:            SCANNER_TEST_LIMIT: ${{ github.event.inputs.test_limit }}
+  68:          run: python scanner_v5.py
+  69:  
+  70:        - name: Commit reports, journals and memory back to the repository
+  71:          # Keeps the journal, report, state and tuning memory version-controlled so the
+  72:          # system learns from session to session without any manual intervention.
+  73:          run: |
+  74:            git config --global user.name "${GIT_AUTHOR_NAME}"
+  75:            git config --global user.email "${GIT_AUTHOR_EMAIL}"
+  76:            git add journal_v5/ reports_v5/ state_v5.json tuner_state_v5.json 2>/dev/null || true
+  77:            git commit -m "Vol5 EOD update $(date -u '+%Y-%m-%d %H:%M UTC')" --allow-empty || true
+  78:            git push origin HEAD:${{ github.ref_name }} || true
