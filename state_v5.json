@@ -1,17 +1,17 @@
 {
  "regime": {
   "label": "UP",
-  "score": 2,
+  "score": 3,
   "votes": {
    "vwap": "1",
    "open": "1",
-   "struct": "-1",
+   "struct": "0",
    "momo": "-1",
    "retrace": "1",
    "reclaim": "1"
   },
-  "note": "467 bars | range 25105-25992"
+  "note": "526 bars | range 25105-25992"
  },
  "pending": {},
- "last_sweep": "2026-11-27T10:34:38.954425+05:30"
+ "last_sweep": "2026-11-27T16:48:30.643625+05:30"
 }
